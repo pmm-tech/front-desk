@@ -6,7 +6,57 @@ from __future__ import unicode_literals
 import datetime
 import frappe
 from frappe.model.document import Document
+from frappe.utils import getdate
 from inn.inn_hotels.doctype.inn_room_rate.inn_room_rate import get_actual_room_rate_breakdown_check_commission
+
+
+def calculate_room_move_booking_boundaries(old_start, old_end, move_date=None):
+	"""Calculate date boundaries and statuses for room move booking segments.
+
+	Ensures that:
+	1. Mid-stay move (move_date > old_start): old booking ends at move_date ('Finished'),
+	   new booking starts at move_date and ends at original departure ('Stayed').
+	2. Same-day move (move_date == old_start): guest spent 0 nights in old room.
+	   Old booking is canceled ('Canceled') so it produces 0 room nights in reports.
+	   New booking starts at move_date and ends at original departure ('Stayed').
+	3. Strict validation: move_date must satisfy old_start <= move_date < old_end.
+	"""
+	if move_date is None:
+		move_date = datetime.date.today()
+	else:
+		move_date = getdate(move_date)
+
+	old_start = getdate(old_start)
+	old_end = getdate(old_end)
+
+	if move_date < old_start:
+		frappe.throw(
+			frappe._("Move date ({0}) cannot be earlier than booking start date ({1})").format(
+				move_date, old_start
+			),
+			frappe.ValidationError,
+		)
+
+	if move_date >= old_end:
+		frappe.throw(
+			frappe._("Move date ({0}) cannot be on or after booking departure date ({1})").format(
+				move_date, old_end
+			),
+			frappe.ValidationError,
+		)
+
+	if move_date == old_start:
+		old_status = "Canceled"
+	else:
+		old_status = "Finished"
+
+	return {
+		"old_status": old_status,
+		"old_end": move_date,
+		"new_start": move_date,
+		"new_end": old_end,
+		"new_status": "Stayed",
+	}
 
 
 class InnMoveRoom(Document):
@@ -63,16 +113,23 @@ def create_move_room_by_reservation(reservation_id, mv_room_type, mv_bed_type, m
 									   'status': 'Stayed'})
 
 	if move_room_doc.old_room_id != move_room_doc.new_room:
-		old_room_booking.status = 'Finished'
+		boundaries = calculate_room_move_booking_boundaries(
+			old_room_booking.start,
+			old_room_booking.end,
+			datetime.date.today(),
+		)
+		old_room_booking.status = boundaries['old_status']
+		old_room_booking.end = boundaries['old_end']
 		old_room_booking.save()
+
 		new_room_booking = frappe.new_doc('Inn Room Booking')
-		new_room_booking.start = datetime.date.today().strftime('%Y-%m-%d')
-		new_room_booking.end = old_room_booking.end
+		new_room_booking.start = boundaries['new_start']
+		new_room_booking.end = boundaries['new_end']
 		new_room_booking.room_id = move_room_doc.new_room
 		new_room_booking.room_availability = 'Room Sold'
 		new_room_booking.reference_type = 'Inn Reservation'
 		new_room_booking.reference_name = reservation_id
-		new_room_booking.status = 'Stayed'
+		new_room_booking.status = boundaries['new_status']
 		new_room_booking.insert()
 
 	# Update Rooms Status

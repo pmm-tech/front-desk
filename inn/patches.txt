@@ -1,0 +1,1 @@
+inn.patches.v1_2.fix_overlapping_room_move_bookings

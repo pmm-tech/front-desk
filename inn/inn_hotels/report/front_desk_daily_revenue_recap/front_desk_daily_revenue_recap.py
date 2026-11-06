@@ -324,13 +324,14 @@ def get_columns(group_by, modes):
     return columns
 
 
-# ---------------------------------------------------------------------------
-# Occupancy and arrivals
-# ---------------------------------------------------------------------------
-def get_occupancy_and_arrivals(dates):
-    # Keep room counts as ints: the columns are Int-typed.
-    inventory = int(frappe.db.sql("select count(*) from `tabInn Room`")[0][0] or 0)
+def calculate_room_occupancy_counts(dates, inventory, bookings):
+    """Calculate daily room occupancy counts with defensive deduplication.
 
+    Protects against duplicate counting when multiple bookings exist for
+    the same physical room or reservation on the same business date (e.g. from
+    overlapping room move segments).
+    Ensures room_nights_sold never exceeds physical inventory.
+    """
     occupancy = {
         business_date: {
             "rooms_inventory": inventory,
@@ -345,36 +346,106 @@ def get_occupancy_and_arrivals(dates):
         for business_date in dates
     }
 
+    if not dates:
+        return occupancy
+
     first, last = dates[0], dates[-1]
 
-    for booking in frappe.db.sql(
-        """
-        select start, end, room_availability, status
-        from `tabInn Room Booking`
-        where start <= %s and end > %s
-        """,
-        (last, first),
-        as_dict=True,
-    ):
-        start = max(getdate(booking.start), first)
-        end = min(getdate(booking.end), add_days(last, 1))
+    # Track seen (date, room_id) and (date, reference_name) to avoid double counting
+    seen_sold_rooms = {d: set() for d in dates}
+    seen_sold_reservations = {d: set() for d in dates}
+    seen_ooo_rooms = {d: set() for d in dates}
+
+    # Sort bookings to prioritize 'Stayed' over 'Finished' over others
+    def booking_sort_key(b):
+        st = b.get("status")
+        if st == "Stayed":
+            return 0
+        elif st == "Finished":
+            return 1
+        elif st == "Booked":
+            return 2
+        return 3
+
+    sorted_bookings = sorted(bookings, key=booking_sort_key)
+
+    for booking in sorted_bookings:
+        start_date = getdate(booking.get("start")) if booking.get("start") else None
+        end_date = getdate(booking.get("end")) if booking.get("end") else None
+        if not start_date or not end_date or start_date >= end_date:
+            continue
+
+        start = max(start_date, first)
+        end = min(end_date, add_days(last, 1))
+
+        availability = booking.get("room_availability")
+        status = booking.get("status")
+        room_id = booking.get("room_id")
+        ref_name = booking.get("reference_name")
 
         for business_date in daterange(start, add_days(end, -1)):
             bucket = occupancy.get(business_date)
             if bucket is None:
                 continue
 
-            availability = booking.room_availability
-            status = booking.status
-
             if availability == ROOM_OUT_OF_ORDER:
+                if room_id:
+                    if room_id in seen_ooo_rooms[business_date]:
+                        continue
+                    seen_ooo_rooms[business_date].add(room_id)
                 bucket["rooms_out_of_order"] += 1
             elif availability == ROOM_HOUSE_USE:
                 bucket["room_nights_house_use"] += 1
             elif availability == ROOM_COMPLIMENTARY:
                 bucket["room_nights_complimentary"] += 1
             elif availability == ROOM_SOLD and status in SOLD_BOOKING_STATUSES:
-                bucket["room_nights_sold"] += 1
+                # Deduplicate by physical room and reservation
+                if room_id and room_id in seen_sold_rooms[business_date]:
+                    continue
+                if ref_name and ref_name in seen_sold_reservations[business_date]:
+                    continue
+
+                if room_id:
+                    seen_sold_rooms[business_date].add(room_id)
+                if ref_name:
+                    seen_sold_reservations[business_date].add(ref_name)
+
+                # Room nights sold can never exceed physical inventory.
+                if bucket["room_nights_sold"] < bucket["rooms_inventory"]:
+                    bucket["room_nights_sold"] += 1
+
+    for business_date, bucket in occupancy.items():
+        bucket["rooms_available"] = max(
+            bucket["rooms_inventory"] - bucket["rooms_out_of_order"], 0
+        )
+        if bucket["rooms_available"]:
+            bucket["occupancy_pct"] = round(
+                100.0 * bucket["room_nights_sold"] / bucket["rooms_available"], 2
+            )
+
+    return occupancy
+
+
+# ---------------------------------------------------------------------------
+# Occupancy and arrivals
+# ---------------------------------------------------------------------------
+def get_occupancy_and_arrivals(dates):
+    # Keep room counts as ints: the columns are Int-typed.
+    inventory = int(frappe.db.sql("select count(*) from `tabInn Room`")[0][0] or 0)
+
+    first, last = dates[0], dates[-1]
+
+    bookings = frappe.db.sql(
+        """
+        select start, end, room_id, reference_name, room_availability, status
+        from `tabInn Room Booking`
+        where start <= %s and end > %s
+        """,
+        (last, first),
+        as_dict=True,
+    )
+
+    occupancy = calculate_room_occupancy_counts(dates, inventory, bookings)
 
     arrivals = {business_date: empty_arrivals() for business_date in dates}
 
