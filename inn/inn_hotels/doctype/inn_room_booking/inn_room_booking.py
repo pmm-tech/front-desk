@@ -5,6 +5,7 @@
 from __future__ import unicode_literals
 import frappe
 from frappe.model.document import Document
+from frappe.utils import getdate
 from inn.inn_hotels.doctype.inn_folio.inn_folio import update_close_by_reservation
 from datetime import date
 from dateutil.parser import parse
@@ -38,6 +39,91 @@ class InnRoomBooking(Document):
                                 'room_status', room_status)
 
 
+def sync_booking_segments_with_reservation(bookings, reservation_status, arrival, departure, actual_room_id=None):
+    """Synchronize room booking segments with reservation status and dates.
+
+    Protects multi-segment reservations (created by room moves) from having
+    internal segment boundaries overwritten.
+    - Status 'Cancel' / 'No Show': Cancels all segments.
+    - Status 'Finish': Marks only the last non-canceled segment as Finished and sets its end to departure.
+    - Status 'In House':
+      * Single segment: syncs start=arrival, end=departure, room_id=actual_room_id, status='Stayed'.
+      * Multi-segment: syncs arrival ONLY to the first non-canceled segment.
+        Syncs departure, actual_room_id, status='Stayed' ONLY to the last non-canceled segment.
+        Intermediate move dates and segment rooms are strictly preserved.
+    """
+    if not bookings:
+        return
+
+    if arrival:
+        arrival = getdate(arrival)
+    if departure:
+        departure = getdate(departure)
+
+    if reservation_status in ['Cancel', 'No Show']:
+        for booking in bookings:
+            if booking.status != 'Canceled':
+                booking.status = 'Canceled'
+                booking.save()
+        return
+
+    non_canceled = [b for b in bookings if b.status != 'Canceled']
+    if not non_canceled:
+        non_canceled = bookings
+
+    if reservation_status == 'Finish':
+        last_booking = non_canceled[-1]
+        changed = False
+        if last_booking.status != 'Finished':
+            last_booking.status = 'Finished'
+            changed = True
+        if departure and getdate(last_booking.end) != departure:
+            last_booking.end = departure
+            changed = True
+        if changed:
+            last_booking.save()
+        return
+
+    if reservation_status == 'In House':
+        if len(non_canceled) == 1:
+            booking = non_canceled[0]
+            changed = False
+            if arrival and getdate(booking.start) != arrival:
+                booking.start = arrival
+                changed = True
+            if departure and getdate(booking.end) != departure:
+                booking.end = departure
+                changed = True
+            if actual_room_id and booking.room_id != actual_room_id:
+                booking.room_id = actual_room_id
+                changed = True
+            if booking.status != 'Stayed':
+                booking.status = 'Stayed'
+                changed = True
+            if changed:
+                booking.save()
+        else:
+            first_booking = non_canceled[0]
+            last_booking = non_canceled[-1]
+
+            if arrival and getdate(first_booking.start) != arrival:
+                first_booking.start = arrival
+                first_booking.save()
+
+            last_changed = False
+            if departure and getdate(last_booking.end) != departure:
+                last_booking.end = departure
+                last_changed = True
+            if actual_room_id and last_booking.room_id != actual_room_id:
+                last_booking.room_id = actual_room_id
+                last_changed = True
+            if last_booking.status != 'Stayed':
+                last_booking.status = 'Stayed'
+                last_changed = True
+            if last_changed:
+                last_booking.save()
+
+
 @frappe.whitelist()
 # Keep the Room Booking valid when Reservation created or updated
 def update_by_reservation(reservation_id):
@@ -49,45 +135,25 @@ def update_by_reservation(reservation_id):
         # Update Folio Close if Reservation get Updated
         update_close_by_reservation(reservation_id)
 
-    if reservation_doc.status == 'Cancel':
-        # If Reservation Canceled, set the Room Booking Status to Canceled
-        room_booking_doc = frappe.get_doc('Inn Room Booking',
-                                          {'reference_type': 'Inn Reservation', 'reference_name': reservation_id})
-        room_booking_doc.status = 'Canceled'
-        room_booking_doc.save()
-        return_message = room_booking_doc.name + \
-            'Status is Canceled by Cancelling Reservation: ' + reservation_id
-    elif reservation_doc.status == 'Finish':
-        # If Reservation Finished (Guest successfully checking out) set the Room Booking Status to Finished
-        room_booking_doc = frappe.get_doc('Inn Room Booking',
-                                          {'reference_type': 'Inn Reservation', 'reference_name': reservation_id})
-        room_booking_doc.status = 'Finished'
-        room_booking_doc.end = reservation_doc.departure
-        room_booking_doc.save()
-        return_message = room_booking_doc.name + \
-            ' Status is Finished by Checking Out Reservation: ' + reservation_id
-    elif reservation_doc.status == 'In House':
-        # Guest successfully Checking In. Set Room Booking Status to Stayed, Update start, end, and room_id according
-        # to the most valid info in Reservation
-        room_booking_doc = frappe.get_doc('Inn Room Booking',
-                                          {'reference_type': 'Inn Reservation', 'reference_name': reservation_id})
-        if reservation_doc.arrival != room_booking_doc.start:
-            room_booking_doc.start = reservation_doc.arrival
-        if reservation_doc.departure != room_booking_doc.end:
-            room_booking_doc.end = reservation_doc.departure
-        if reservation_doc.actual_room_id != room_booking_doc.room_id:
-            room_booking_doc.room_id = reservation_doc.actual_room_id
-        room_booking_doc.status = 'Stayed'
-        room_booking_doc.save()
-        return_message = room_booking_doc.name + \
-            ' Updated by Checking In Process in Reservation: ' + reservation_doc.name
-    elif reservation_doc.status == 'No Show':
-        room_booking_doc = frappe.get_doc('Inn Room Booking',
-                                          {'reference_type': 'Inn Reservation', 'reference_name': reservation_id})
-        room_booking_doc.status = 'Canceled'
-        room_booking_doc.save()
-        return_message = room_booking_doc.name + \
-            'Status is Canceled by No Show of Reservation: ' + reservation_id
+    if reservation_doc.status in ['Cancel', 'Finish', 'In House', 'No Show']:
+        booking_names = frappe.get_all(
+            'Inn Room Booking',
+            filters={'reference_type': 'Inn Reservation', 'reference_name': reservation_id},
+            order_by='start asc, creation asc',
+            pluck='name'
+        )
+        bookings = [frappe.get_doc('Inn Room Booking', name) for name in booking_names]
+        if bookings:
+            sync_booking_segments_with_reservation(
+                bookings=bookings,
+                reservation_status=reservation_doc.status,
+                arrival=reservation_doc.arrival,
+                departure=reservation_doc.departure,
+                actual_room_id=reservation_doc.actual_room_id,
+            )
+            return_message = 'Synchronized {0} Room Bookings for Reservation: {1}'.format(
+                len(bookings), reservation_id
+            )
     else:
         # Reservation status is Reserved
         if not frappe.db.exists('Inn Room Booking',
