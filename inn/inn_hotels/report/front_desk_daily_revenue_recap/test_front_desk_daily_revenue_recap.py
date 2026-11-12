@@ -219,3 +219,129 @@ class TestFilterContract(unittest.TestCase):
             ", ".join('"{0}"'.format(option) for option in recap.GROUP_BY_OPTIONS)
         )
         self.assertIn(expected, self.js_source())
+
+
+class TestOccupancyDeduplication(unittest.TestCase):
+    def test_room_move_overlap_same_reservation_counted_once(self):
+        """Room move overlap (old Finished + new Stayed) must deduplicate to 1 room night."""
+        dates = [frappe.utils.getdate("2026-10-31")]
+        inventory = 120
+        bookings = [
+            {
+                "start": "2026-10-28",
+                "end": "2026-11-02",
+                "room_id": "R-1012",
+                "reference_name": "RSV-29690",
+                "room_availability": recap.ROOM_SOLD,
+                "status": "Finished",
+            },
+            {
+                "start": "2026-10-31",
+                "end": "2026-11-02",
+                "room_id": "R-1014",
+                "reference_name": "RSV-29690",
+                "room_availability": recap.ROOM_SOLD,
+                "status": "Stayed",
+            },
+        ]
+
+        occupancy = recap.calculate_room_occupancy_counts(dates, inventory, bookings)
+        day_bucket = occupancy[dates[0]]
+
+        self.assertEqual(day_bucket["room_nights_sold"], 1)
+
+    def test_same_physical_room_overlap_counted_once(self):
+        """Two bookings claiming the same physical room on the same date count as 1 room night."""
+        dates = [frappe.utils.getdate("2026-10-31")]
+        inventory = 120
+        bookings = [
+            {
+                "start": "2026-10-30",
+                "end": "2026-11-01",
+                "room_id": "R-1012",
+                "reference_name": "RSV-001",
+                "room_availability": recap.ROOM_SOLD,
+                "status": "Finished",
+            },
+            {
+                "start": "2026-10-31",
+                "end": "2026-11-02",
+                "room_id": "R-1012",
+                "reference_name": "RSV-002",
+                "room_availability": recap.ROOM_SOLD,
+                "status": "Stayed",
+            },
+        ]
+
+        occupancy = recap.calculate_room_occupancy_counts(dates, inventory, bookings)
+        day_bucket = occupancy[dates[0]]
+
+        self.assertEqual(day_bucket["room_nights_sold"], 1)
+
+    def test_occupancy_never_exceeds_inventory_ceiling(self):
+        """Room nights sold can never exceed total rooms inventory."""
+        dates = [frappe.utils.getdate("2026-10-31")]
+        inventory = 5
+        # 10 bookings for 5 rooms
+        bookings = [
+            {
+                "start": "2026-10-31",
+                "end": "2026-11-01",
+                "room_id": "R-{0}".format(i),
+                "reference_name": "RSV-{0}".format(i),
+                "room_availability": recap.ROOM_SOLD,
+                "status": "Stayed",
+            }
+            for i in range(10)
+        ]
+
+        occupancy = recap.calculate_room_occupancy_counts(dates, inventory, bookings)
+        day_bucket = occupancy[dates[0]]
+
+        self.assertLessEqual(day_bucket["room_nights_sold"], 5)
+
+    def test_zero_inventory_has_zero_sold_room_nights(self):
+        """No physical inventory must not allow sold-room counts to grow."""
+        dates = [frappe.utils.getdate("2026-10-31")]
+        bookings = [
+            {
+                "start": "2026-10-31",
+                "end": "2026-11-01",
+                "room_id": "R-101",
+                "reference_name": "RSV-001",
+                "room_availability": recap.ROOM_SOLD,
+                "status": "Stayed",
+            }
+        ]
+
+        occupancy = recap.calculate_room_occupancy_counts(dates, 0, bookings)
+        self.assertEqual(occupancy[dates[0]]["room_nights_sold"], 0)
+
+    def test_out_of_order_deduplication(self):
+        """Duplicate Out of Order bookings on the same room are counted once."""
+        dates = [frappe.utils.getdate("2026-10-31")]
+        inventory = 10
+        bookings = [
+            {
+                "start": "2026-10-30",
+                "end": "2026-11-02",
+                "room_id": "R-101",
+                "reference_name": None,
+                "room_availability": recap.ROOM_OUT_OF_ORDER,
+                "status": "Booked",
+            },
+            {
+                "start": "2026-10-31",
+                "end": "2026-11-03",
+                "room_id": "R-101",
+                "reference_name": None,
+                "room_availability": recap.ROOM_OUT_OF_ORDER,
+                "status": "Booked",
+            },
+        ]
+
+        occupancy = recap.calculate_room_occupancy_counts(dates, inventory, bookings)
+        day_bucket = occupancy[dates[0]]
+
+        self.assertEqual(day_bucket["rooms_out_of_order"], 1)
+
