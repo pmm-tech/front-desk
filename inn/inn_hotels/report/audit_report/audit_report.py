@@ -35,7 +35,27 @@ Fixed relative to the previous implementation
 ``mode_of_payment`` was a sliced concatenation (``[:-2]``); now clean,
                     comma-joined Mode of Payment values.
 ``paid_date``       was always empty; now the earliest payment date.
+``actual_room_nett`` / ``bf_revenue``
+                    now **nett**, not gross. The v1.2.0 refactor replaced
+                    exact transaction-type matching with line classification,
+                    which folded ``Room Charge Tax/Service`` into ``Room
+                    Charge`` and silently turned both columns into gross --
+                    room overstated 20%, breakfast 21% on the date this was
+                    found. The split now uses
+                    :func:`inn.helper.revenue_lines.get_tax_service_types`.
 ``remark``          unchanged (``Inn Folio.bill_instructions``).
+
+Two things the nett columns deliberately do **not** do:
+
+* They never apply a tax rate. ``Inn Tax`` may be ``No Service Tax``,
+  ``Service Only (10%)`` or ``Service Tax 21%``, and a posting may carry only
+  one of a tax's breakdown rows, so the posted tax/service rows are subtracted
+  rather than any percentage of the gross.
+* They never read ``Inn Reservation.nett_actual_room_rate``. That field is a
+  single current scalar, not a per-night history -- it is rewritten on room
+  move and by ``recalculate_nett_charge()`` -- and it disagrees with what was
+  posted on roughly 15% of room-charge folio-days. The posted transactions are
+  the source of truth for a business date.
 
 The payment classification rules live in ``inn.helper.revenue_lines`` so this
 report and ``Front Desk Daily Revenue Recap`` cannot disagree.
@@ -51,6 +71,7 @@ from inn.helper.revenue_lines import (
     classify,
     get_line_map,
     get_settings_context,
+    get_tax_service_types,
     unmapped_types,
 )
 
@@ -124,6 +145,7 @@ def get_data(filters):
 def get_data_detail(on_date, is_show_mode_payment=True):
     context = get_settings_context()
     line_map = get_line_map(context)
+    tax_service_types = get_tax_service_types(context)
 
     reservations = get_reservations(on_date)
     orphan_folios = get_folios_without_reservation(on_date)
@@ -139,10 +161,10 @@ def get_data_detail(on_date, is_show_mode_payment=True):
             for row in reservations
         ]
 
-    detail, unmapped = summarise_transactions(
-        get_transactions_for_date(folio_names, on_date), line_map
-    )
+    transactions = get_transactions_for_date(folio_names, on_date)
+    detail, unmapped = summarise_transactions(transactions, line_map, tax_service_types)
     warn_unmapped_types(unmapped)
+    warn_unrecognised_tax_service_types(transactions, tax_service_types, line_map)
 
     settlement = get_settlement_status(folio_names, on_date)
 
@@ -305,7 +327,15 @@ def empty_detail():
     }
 
 
-def summarise_transactions(transactions, line_map):
+def summarise_transactions(transactions, line_map, tax_service_types):
+    """Aggregate one folio's transactions into the report's money columns.
+
+    ``tax_service_types`` is **required and has no default**. A caller that
+    omitted it would silently sum the tax/service rows into the nett columns
+    and report gross as nett -- which is precisely the defect this signature
+    exists to prevent. Making it required turns that mistake into a
+    ``TypeError`` at the call site instead of a plausible wrong number.
+    """
     detail = {}
     charge_types = set()
 
@@ -327,12 +357,20 @@ def summarise_transactions(transactions, line_map):
         charge_types.add(trx.transaction_type)
         line = classify(trx.transaction_type, line_map)
 
+        # The tax/service element of a revenue line shares that line, so it must
+        # be excluded by type. Subtracting a percentage of the gross would be
+        # wrong: the rate varies per reservation and a posting may carry only
+        # one of a tax's breakdown rows.
+        is_tax_service = trx.transaction_type in tax_service_types
+
         if line == LINE_ROOM:
-            bucket["actual_room_nett"] += amount
+            if not is_tax_service:
+                bucket["actual_room_nett"] += amount
             if trx.actual_room_rate:
                 bucket["actual_room_rate"] = flt(trx.actual_room_rate)
         elif line == LINE_BREAKFAST:
-            bucket["breakfast_revenue"] += amount
+            if not is_tax_service:
+                bucket["breakfast_revenue"] += amount
         elif line == LINE_COMMISSION:
             bucket["comission"] += amount
 
@@ -340,6 +378,48 @@ def summarise_transactions(transactions, line_map):
     # design and must not be reported as a gap.
     unmapped = unmapped_types(charge_types, line_map)
     return detail, unmapped
+
+
+def unrecognised_tax_service_types(transactions, tax_service_types, line_map):
+    """Charge types that look like tax/service but are not in the split set.
+
+    :func:`get_tax_service_types` recognises the shipped names plus
+    ``<configured revenue type> Tax/Service``. A site posting a room or
+    breakfast tax under any other name would keep reporting gross, silently --
+    the same failure this module just fixed, one configuration away. These are
+    the types worth looking at: they carry a tax/service name and feed a nett
+    column, yet are not excluded from it.
+    """
+    suspects = set()
+
+    for trx in transactions:
+        if (trx.flag or "").strip().lower() == "credit":
+            continue
+        name = trx.transaction_type
+        if not name or name in tax_service_types:
+            continue
+        if "tax/service" not in name.lower():
+            continue
+        if classify(name, line_map) in (LINE_ROOM, LINE_BREAKFAST):
+            suspects.add(name)
+
+    return sorted(suspects)
+
+
+def warn_unrecognised_tax_service_types(transactions, tax_service_types, line_map):
+    suspects = unrecognised_tax_service_types(transactions, tax_service_types, line_map)
+    if not suspects:
+        return
+    frappe.msgprint(
+        msg=(
+            "Transaction types that look like tax/service but are not in this "
+            "site's tax/service set, so they are counted as nett: {0}".format(
+                ", ".join(suspects)
+            )
+        ),
+        title="Unrecognised tax/service types",
+        indicator="orange",
+    )
 
 
 def warn_unmapped_types(unmapped):
