@@ -6,6 +6,13 @@
 These cover the regressions that made the report disagree with the finance
 spreadsheet, so they are deliberately DB-free: the classification rules are
 passed in rather than read from Inn Hotels Setting.
+
+The money tests are written against *posted transactions*, which are the
+report's source of truth for a business date. ``Inn Reservation``'s
+``nett_actual_room_rate`` is deliberately NOT used: it is a single current
+scalar rather than a per-night history, and it disagrees with what was posted
+on roughly 15% of room-charge folio-days. That divergence is tracked
+separately -- do not "simplify" this report back to the reservation field.
 """
 
 from __future__ import unicode_literals
@@ -28,10 +35,17 @@ LINE_MAP = {
     "Room Charge": LINE_ROOM,
     "Room Charge Tax/Service": LINE_ROOM,
     "Breakfast Charge": LINE_BREAKFAST,
+    "Breakfast Charge Tax/Service": LINE_BREAKFAST,
     "Commision": LINE_COMMISSION,
     "Refund": LINE_REFUND,
     "Restaurant Food": LINE_OTHER,
 }
+
+#: The types carrying the tax/service element of a revenue line. Mirrors
+#: ``get_tax_service_types()`` for the shipped transaction type names, and is
+#: passed in rather than read from ``Inn Hotels Setting`` to keep these tests
+#: DB-free.
+TAX_SERVICE_TYPES = {"Room Charge Tax/Service", "Breakfast Charge Tax/Service"}
 
 ON_DATE = "2025-11-05"
 
@@ -123,6 +137,7 @@ class TestAuditReportAggregation(unittest.TestCase):
                 trx("Deposit", "Credit", 400, mode="Voucher"),
             ],
             LINE_MAP,
+            TAX_SERVICE_TYPES,
         )
         self.assertEqual(detail["F-1"]["total_amount"], 1000)
 
@@ -134,12 +149,13 @@ class TestAuditReportAggregation(unittest.TestCase):
                 trx("Room Payment", "Credit", 500, mode="Cash"),
             ],
             LINE_MAP,
+            TAX_SERVICE_TYPES,
         )
         self.assertEqual(detail["F-1"]["total_amount"], 500)
         self.assertEqual(detail["F-1"]["actual_room_nett"], 500)
 
     def test_refund_is_not_room_revenue(self):
-        detail, _ = audit_report.summarise_transactions([trx("Refund", "Debit", 75)], LINE_MAP)
+        detail, _ = audit_report.summarise_transactions([trx("Refund", "Debit", 75)], LINE_MAP, TAX_SERVICE_TYPES)
         self.assertEqual(detail["F-1"]["actual_room_nett"], 0)
         self.assertEqual(detail["F-1"]["breakfast_revenue"], 0)
 
@@ -152,19 +168,136 @@ class TestAuditReportAggregation(unittest.TestCase):
                 trx("Payment", "Credit", 100, mode="Cash"),
             ],
             LINE_MAP,
+            TAX_SERVICE_TYPES,
         )
         self.assertEqual(detail["F-1"]["modes"], {"BCA EDC", "Cash"})
 
-    def test_tax_service_lines_are_room_and_breakfast_revenue(self):
+    def test_tax_service_lines_are_excluded_from_room_nett(self):
+        """The column is named "Actual Room Nett", so it must hold the nett.
+
+        Regression: the v1.2.0 refactor replaced exact transaction-type matching
+        with line classification, which folded "Room Charge Tax/Service" into the
+        same bucket as "Room Charge" and silently turned the column into gross.
+        """
+        detail, _ = audit_report.summarise_transactions(
+            [
+                trx("Room Charge", "Debit", 500),
+                trx("Room Charge Tax/Service", "Debit", 105),
+            ],
+            LINE_MAP,
+            TAX_SERVICE_TYPES,
+        )
+        self.assertEqual(detail["F-1"]["actual_room_nett"], 500)
+
+    def test_tax_service_lines_are_excluded_from_breakfast_nett(self):
+        detail, _ = audit_report.summarise_transactions(
+            [
+                trx("Breakfast Charge", "Debit", 80),
+                trx("Breakfast Charge Tax/Service", "Debit", 16.8),
+            ],
+            LINE_MAP,
+            TAX_SERVICE_TYPES,
+        )
+        self.assertEqual(detail["F-1"]["breakfast_revenue"], 80)
+
+    def test_room_nett_follows_the_posted_rows_not_a_tax_rate(self):
+        """The tax/service split is not a fixed 21%.
+
+        ``Inn Tax`` can be "No Service Tax", "Service Only (10%)" or "Service
+        Tax 21%", and a reservation can post only one of that tax's breakdown
+        rows. Measured on a live folio: 409,090 nett with a single 40,910 tax
+        row (10%) -- not the 371,899 a 21% split would imply, which is what the
+        reservation's own ``nett_actual_room_rate`` holds.
+
+        A fix that subtracted a fixed percentage of the gross would pass the
+        21% case above and fail here, so this pins that the report subtracts
+        the *posted* tax/service rows rather than applying any rate.
+        """
+        detail, _ = audit_report.summarise_transactions(
+            [
+                trx("Room Charge", "Debit", 409090),
+                trx("Room Charge Tax/Service", "Debit", 40910),
+            ],
+            LINE_MAP,
+            TAX_SERVICE_TYPES,
+        )
+        self.assertEqual(detail["F-1"]["actual_room_nett"], 409090)
+
+    def test_tax_only_folio_reports_zero_nett(self):
+        """No nett row posted means no nett revenue, however large the tax."""
         detail, _ = audit_report.summarise_transactions(
             [
                 trx("Room Charge Tax/Service", "Debit", 121),
-                trx("Breakfast Charge", "Debit", 80),
+                trx("Breakfast Charge Tax/Service", "Debit", 21),
             ],
             LINE_MAP,
+            TAX_SERVICE_TYPES,
         )
-        self.assertEqual(detail["F-1"]["actual_room_nett"], 121)
-        self.assertEqual(detail["F-1"]["breakfast_revenue"], 80)
+        self.assertEqual(detail["F-1"]["actual_room_nett"], 0)
+        self.assertEqual(detail["F-1"]["breakfast_revenue"], 0)
+
+    def test_tax_service_lines_are_still_recognised(self):
+        """The replaced test's real intent, kept.
+
+        Tax/service rows have a known revenue line, so excluding them from the
+        nett columns must not cause them to be reported as unmapped.
+        """
+        _, unmapped = audit_report.summarise_transactions(
+            [
+                trx("Room Charge Tax/Service", "Debit", 121),
+                trx("Breakfast Charge Tax/Service", "Debit", 21),
+            ],
+            LINE_MAP,
+            TAX_SERVICE_TYPES,
+        )
+        self.assertEqual(unmapped, [])
+
+    def test_tax_service_is_not_counted_as_a_collection(self):
+        """Excluding tax/service from nett must not leak it into Total Amount."""
+        detail, _ = audit_report.summarise_transactions(
+            [
+                trx("Room Charge", "Debit", 500),
+                trx("Room Charge Tax/Service", "Debit", 105),
+            ],
+            LINE_MAP,
+            TAX_SERVICE_TYPES,
+        )
+        self.assertEqual(detail["F-1"]["total_amount"], 0)
+
+    def test_unrecognised_tax_service_type_is_reported(self):
+        """A tax type outside the configured set would silently inflate nett.
+
+        ``get_tax_service_types()`` recognises the shipped names plus
+        ``<configured revenue type> Tax/Service``. A type that feeds a nett
+        column and carries a tax/service name but is not in that set is
+        reported, rather than quietly counted as revenue.
+        """
+        line_map = dict(LINE_MAP, **{"Room Tax/Service": LINE_ROOM})
+        suspects = audit_report.unrecognised_tax_service_types(
+            [
+                trx("Room Charge", "Debit", 500),
+                trx("Room Tax/Service", "Debit", 105),
+                trx("Room Charge Tax/Service", "Debit", 105),
+                trx("Room Payment", "Credit", 500, mode="Cash"),
+            ],
+            TAX_SERVICE_TYPES,
+            line_map,
+        )
+        self.assertEqual(suspects, ["Room Tax/Service"])
+
+    def test_no_suspects_when_every_tax_service_type_is_configured(self):
+        suspects = audit_report.unrecognised_tax_service_types(
+            [
+                trx("Room Charge", "Debit", 500),
+                trx("Room Charge Tax/Service", "Debit", 105),
+                trx("Breakfast Charge", "Debit", 80),
+                trx("Breakfast Charge Tax/Service", "Debit", 16.8),
+                trx("Restaurant Food", "Debit", 40),
+            ],
+            TAX_SERVICE_TYPES,
+            LINE_MAP,
+        )
+        self.assertEqual(suspects, [])
 
     def test_actual_room_rate_is_taken_from_the_room_charge(self):
         detail, _ = audit_report.summarise_transactions(
@@ -173,19 +306,20 @@ class TestAuditReportAggregation(unittest.TestCase):
                 trx("Room Charge", "Debit", 500, rate=None),
             ],
             LINE_MAP,
+            TAX_SERVICE_TYPES,
         )
         self.assertEqual(detail["F-1"]["actual_room_rate"], 550000)
 
     def test_commission_is_collected_separately(self):
         detail, _ = audit_report.summarise_transactions(
-            [trx("Commision", "Debit", 90)], LINE_MAP
+            [trx("Commision", "Debit", 90)], LINE_MAP, TAX_SERVICE_TYPES
         )
         self.assertEqual(detail["F-1"]["comission"], 90)
         self.assertEqual(detail["F-1"]["total_amount"], 0)
 
     def test_unmapped_type_is_reported(self):
         _, unmapped = audit_report.summarise_transactions(
-            [trx("Brand New Charge", "Debit", 10)], LINE_MAP
+            [trx("Brand New Charge", "Debit", 10)], LINE_MAP, TAX_SERVICE_TYPES
         )
         self.assertEqual(unmapped, ["Brand New Charge"])
 
@@ -204,13 +338,14 @@ class TestAuditReportAggregation(unittest.TestCase):
                 trx("Room Charge", "Debit", 400),
             ],
             LINE_MAP,
+            TAX_SERVICE_TYPES,
         )
         self.assertEqual(unmapped, [])
 
     def test_collections_still_counted_when_classification_skipped(self):
         """Credits bypass classification, so the credit branch must still run."""
         detail, _ = audit_report.summarise_transactions(
-            [trx("Room Payment", "Credit", 250, mode="BCA EDC")], LINE_MAP
+            [trx("Room Payment", "Credit", 250, mode="BCA EDC")], LINE_MAP, TAX_SERVICE_TYPES
         )
         self.assertEqual(detail["F-1"]["total_amount"], 250)
         self.assertEqual(detail["F-1"]["modes"], {"BCA EDC"})
