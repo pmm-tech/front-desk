@@ -411,11 +411,15 @@ class TestAuditReportRowShaping(unittest.TestCase):
         )
         self.assertEqual(row_value(row, "mode_of_payment"), "")
 
-    def test_orphan_folio_row_keeps_contract_and_names_the_folio(self):
-        row = audit_report.build_orphan_row(
-            frappe._dict(name="F-16280", type="Desk", customer_id=None, channel=None,
-                         bill_instructions="misc"),
-            self.detail, audit_report.STATUS_PAID, 1, ON_DATE,
+    def test_a_folio_without_a_reservation_keeps_the_contract_and_names_the_folio(self):
+        source = audit_report.resolve_folio_row(frappe._dict(
+            folio="F-16280", folio_type="Desk", folio_customer_id=None,
+            folio_channel=None, folio_bill_instructions="misc",
+            reservation=None, customer_id=None, room_type=None, bed_type=None,
+            actual_room_id=None, channel=None, bill_instructions=None,
+        ))
+        row = audit_report.build_row(
+            source, self.detail, audit_report.STATUS_PAID, 1, ON_DATE,
         )
         self.assertEqual(len(row), len(audit_report.get_columns()))
         self.assertEqual(row_value(row, "rsv"), "F-16280")
@@ -447,62 +451,163 @@ class TestAuditReportRowShaping(unittest.TestCase):
         self.assertEqual(row_value(row, "audit_date"), ON_DATE)
 
 
-class TestAuditReportWithoutFolios(unittest.TestCase):
-    """The branch where reservations exist but none of them has a folio.
+class TestAuditReportFolioDrivenRows(unittest.TestCase):
+    """Rows come from folios carrying a room charge, and only from those.
 
-    No such reservation existed on the dev bench for November 2025, so this
-    path is exercised with mocks rather than assumed to work.
+    The report used to select reservations -- in house, plus any with activity
+    that day -- and then look up each one's folio. It now selects folios
+    directly, so a reservation with no folio can no longer produce a row. That
+    is the point: a stay with no room charge is not a room charge.
     """
 
-    def test_reservations_without_any_folio_still_produce_rows(self):
-        reservations = [
-            frappe._dict(name="RSV-NOFOLIO-A", status="In House", customer_id="CUST-1",
-                         room_type="Deluxe", bed_type="Queen", actual_room_id="R-101",
-                         channel="Walk In", actual_room_rate=550000, folio=None,
-                         bill_instructions=None),
-            frappe._dict(name="RSV-NOFOLIO-B", status="Finish", customer_id="CUST-2",
-                         room_type="Superior", bed_type="Twin", actual_room_id="R-202",
-                         channel="Traveloka", actual_room_rate=410000, folio=None,
-                         bill_instructions=None),
-        ]
+    def folio_row(self, folio, name=None):
+        return frappe._dict(
+            folio=folio, name=name or folio, customer_id="CUST-1",
+            room_type="", bed_type="", actual_room_id="", channel="Walk In",
+            bill_instructions=None,
+        )
 
-        with mock.patch.object(audit_report, "get_reservations", return_value=reservations), \
-                mock.patch.object(audit_report, "get_folios_without_reservation", return_value=[]):
-            rows = audit_report.get_data_detail(ON_DATE, 1)
-
-        self.assertEqual(len(rows), len(reservations))
-        for row, reservation in zip(rows, reservations):
-            self.assertEqual(len(row), len(audit_report.get_columns()))
-            self.assertEqual(row_value(row, "rsv"), reservation.name)
-            self.assertEqual(row_value(row, "bed_type"), reservation.bed_type)
-            self.assertEqual(row_value(row, "total_amount"), 0)
-            self.assertEqual(row_value(row, "status"), "")
-            self.assertEqual(row_value(row, "audit_date"), ON_DATE)
-
-    def test_no_folios_and_no_reservations_returns_nothing(self):
-        with mock.patch.object(audit_report, "get_reservations", return_value=[]), \
-                mock.patch.object(audit_report, "get_folios_without_reservation", return_value=[]):
+    def test_no_selected_folios_produces_no_rows(self):
+        with mock.patch.object(audit_report, "get_folio_rows", return_value=[]):
             self.assertEqual(audit_report.get_data_detail(ON_DATE, 1), [])
 
-    def test_orphan_folio_alone_is_still_reported(self):
-        """A Desk folio with activity but no reservation must not be lost."""
-        orphan = frappe._dict(name="F-16280", type="Desk", customer_id=None,
-                              channel=None, bill_instructions="misc")
+    def test_one_row_is_emitted_per_selected_folio(self):
+        rows = [self.folio_row("F-1", "RSV-1"), self.folio_row("F-2", "RSV-2")]
 
-        detail = audit_report.empty_detail()
-        detail["total_amount"] = 912500
-        detail["modes"] = {"Cash"}
-
-        with mock.patch.object(audit_report, "get_reservations", return_value=[]), \
-                mock.patch.object(audit_report, "get_folios_without_reservation", return_value=[orphan]), \
+        with mock.patch.object(audit_report, "get_folio_rows", return_value=rows), \
                 mock.patch.object(audit_report, "get_transactions_for_date", return_value=[]), \
-                mock.patch.object(audit_report, "summarise_transactions", return_value=({"F-16280": detail}, [])), \
-                mock.patch.object(audit_report, "get_settlement_status", return_value={"F-16280": audit_report.STATUS_UNPAID}):
-            rows = audit_report.get_data_detail(ON_DATE, 1)
+                mock.patch.object(audit_report, "get_settlement_status", return_value={}):
+            out = audit_report.get_data_detail(ON_DATE, 1)
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(len(rows[0]), len(audit_report.get_columns()))
-        self.assertEqual(row_value(rows[0], "rsv"), "F-16280")
-        self.assertEqual(row_value(rows[0], "bed_type"), "")
-        self.assertEqual(row_value(rows[0], "total_amount"), 912500)
-        self.assertEqual(row_value(rows[0], "status"), audit_report.STATUS_UNPAID)
+        self.assertEqual(len(out), 2)
+        self.assertEqual([row_value(row, "rsv") for row in out], ["RSV-1", "RSV-2"])
+        for row in out:
+            self.assertEqual(len(row), len(audit_report.get_columns()))
+            self.assertEqual(row_value(row, "audit_date"), ON_DATE)
+
+    def test_every_selected_folio_is_queried_for_its_transactions(self):
+        rows = [self.folio_row("F-1"), self.folio_row("F-2")]
+
+        with mock.patch.object(audit_report, "get_folio_rows", return_value=rows), \
+                mock.patch.object(audit_report, "get_transactions_for_date",
+                                  return_value=[]) as transactions, \
+                mock.patch.object(audit_report, "get_settlement_status", return_value={}):
+            audit_report.get_data_detail(ON_DATE, 1)
+
+        self.assertEqual(sorted(transactions.call_args[0][0]), ["F-1", "F-2"])
+        self.assertEqual(transactions.call_args[0][1], ON_DATE)
+
+
+class TestRoomLineTypes(unittest.TestCase):
+    """The selection type set is derived from the line map, never hardcoded."""
+
+    def test_room_types_come_from_the_line_map(self):
+        self.assertEqual(
+            audit_report.get_room_line_types(LINE_MAP),
+            {"Room Charge", "Room Charge Tax/Service"},
+        )
+
+    def test_a_renamed_configured_revenue_type_is_included(self):
+        line_map = dict(LINE_MAP)
+        line_map["Accommodation"] = LINE_ROOM
+        self.assertIn("Accommodation", audit_report.get_room_line_types(line_map))
+
+    def test_non_room_lines_are_excluded(self):
+        types = audit_report.get_room_line_types(LINE_MAP)
+        for name in ("Breakfast Charge", "Commision", "Restaurant Food"):
+            self.assertNotIn(name, types, "%s must not select a room charge row" % name)
+
+    def test_an_empty_line_map_selects_nothing(self):
+        self.assertEqual(audit_report.get_room_line_types({}), set())
+
+
+class TestFolioRowResolution(unittest.TestCase):
+    """One selected folio becomes one report row source."""
+
+    def test_a_folio_with_a_reservation_renders_the_reservation(self):
+        row = audit_report.resolve_folio_row(frappe._dict(
+            folio="F-1", folio_type="Guest", folio_customer_id="FOLIO-CUST",
+            folio_channel="Direct", folio_bill_instructions="note",
+            reservation="RSV-1", customer_id="CUST-1", room_type="Superior",
+            bed_type="Double", actual_room_id="R-620", channel="TIKET.COM",
+        ))
+
+        self.assertEqual(row.name, "RSV-1")
+        self.assertEqual(row.folio, "F-1")
+        self.assertEqual(row.customer_id, "CUST-1")
+        self.assertEqual(row.actual_room_id, "R-620")
+        self.assertEqual(row.channel, "TIKET.COM")
+        # Inn Reservation has no bill_instructions; the remark is the folio's.
+        self.assertEqual(row.bill_instructions, "note")
+
+    def test_a_folio_without_a_reservation_names_itself_and_its_type(self):
+        row = audit_report.resolve_folio_row(frappe._dict(
+            folio="F-27433", folio_type="Master", folio_customer_id="IBU GEDE KARIM",
+            folio_channel="Direct", folio_bill_instructions=None,
+            reservation=None, customer_id=None, room_type=None, bed_type=None,
+            actual_room_id=None, channel=None, bill_instructions=None,
+        ))
+
+        self.assertEqual(row.name, "F-27433")
+        self.assertEqual(row.customer_id, "IBU GEDE KARIM")
+        self.assertEqual(row.channel, "Direct")
+        self.assertEqual(row.room_type, "")
+        self.assertEqual(row.bed_type, "")
+        self.assertEqual(row.actual_room_id, "")
+        self.assertEqual(row.bill_instructions, "Master folio F-27433")
+
+    def test_a_folio_with_no_type_still_names_itself(self):
+        row = audit_report.resolve_folio_row(frappe._dict(
+            folio="F-9", folio_type=None, folio_customer_id=None,
+            folio_channel=None, folio_bill_instructions=None,
+            reservation=None, customer_id=None, room_type=None, bed_type=None,
+            actual_room_id=None, channel=None, bill_instructions=None,
+        ))
+
+        self.assertEqual(row.bill_instructions, "Non-guest folio F-9")
+
+    def test_folio_instructions_are_appended_to_the_remark(self):
+        row = audit_report.resolve_folio_row(frappe._dict(
+            folio="F-9", folio_type="Desk", folio_customer_id=None,
+            folio_channel=None, folio_bill_instructions="misc",
+            reservation=None, customer_id=None, room_type=None, bed_type=None,
+            actual_room_id=None, channel=None, bill_instructions=None,
+        ))
+
+        self.assertEqual(row.bill_instructions, "Desk folio F-9: misc")
+
+
+class TestSelectionQuery(unittest.TestCase):
+    """The predicate's three conditions, guarded at the SQL level.
+
+    A mocked test cannot prove which folios the query returns -- that is
+    test_audit_report_selection.py's job, against real records. It can prove the
+    query still carries the conditions the predicate depends on, which is where
+    a careless edit does its damage.
+    """
+
+    def captured_call(self, line_map=LINE_MAP, on_date=ON_DATE):
+        with mock.patch.object(frappe.db, "sql", return_value=[]) as sql:
+            audit_report.get_folio_rows(on_date, line_map)
+        return sql.call_args
+
+    def test_the_query_filters_on_the_report_date_and_non_void_rows(self):
+        query, params = self.captured_call()[0]
+
+        self.assertIn("trx.audit_date = %s", query)
+        self.assertIn("trx.is_void = 0", query)
+        self.assertIn(ON_DATE, params)
+
+    def test_the_query_binds_every_room_line_type_and_no_other(self):
+        _, params = self.captured_call()[0]
+        bound = set(params)
+
+        self.assertTrue({"Room Charge", "Room Charge Tax/Service"} <= bound, bound)
+        self.assertNotIn("Breakfast Charge", bound)
+        self.assertNotIn("Restaurant Food", bound)
+
+    def test_no_room_line_types_selects_nothing_without_querying(self):
+        with mock.patch.object(frappe.db, "sql") as sql:
+            self.assertEqual(audit_report.get_folio_rows(ON_DATE, {}), [])
+
+        sql.assert_not_called()

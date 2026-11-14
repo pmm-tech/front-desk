@@ -147,20 +147,11 @@ def get_data_detail(on_date, is_show_mode_payment=True):
     line_map = get_line_map(context)
     tax_service_types = get_tax_service_types(context)
 
-    reservations = get_reservations(on_date)
-    orphan_folios = get_folios_without_reservation(on_date)
+    rows = get_folio_rows(on_date, line_map)
+    if not rows:
+        return []
 
-    folio_names = sorted(
-        {row.folio for row in reservations if row.folio}
-        | {folio.name for folio in orphan_folios}
-    )
-
-    if not folio_names:
-        return [
-            build_row(row, empty_detail(), "", is_show_mode_payment, on_date)
-            for row in reservations
-        ]
-
+    folio_names = [row.folio for row in rows]
     transactions = get_transactions_for_date(folio_names, on_date)
     detail, unmapped = summarise_transactions(transactions, line_map, tax_service_types)
     warn_unmapped_types(unmapped)
@@ -168,94 +159,110 @@ def get_data_detail(on_date, is_show_mode_payment=True):
 
     settlement = get_settlement_status(folio_names, on_date)
 
-    return [build_row(row, detail.get(row.folio) or empty_detail(),
-                      settlement.get(row.folio, ""), is_show_mode_payment, on_date)
-            for row in reservations] + [
-        build_orphan_row(folio, detail.get(folio.name) or empty_detail(),
-                         settlement.get(folio.name, ""), is_show_mode_payment, on_date)
-        for folio in orphan_folios
+    return [
+        build_row(row, detail.get(row.folio) or empty_detail(),
+                  settlement.get(row.folio, ""), is_show_mode_payment, on_date)
+        for row in rows
     ]
 
 
 # ---------------------------------------------------------------------------
 # Queries
 # ---------------------------------------------------------------------------
-def get_reservations(on_date):
-    """Reservations in house on ``on_date``, plus any with activity that day.
+def get_room_line_types(line_map):
+    """The transaction types that feed the room line for this site.
 
-    The original predicate (status plus expected dates) is preserved. The extra
-    branch guarantees a folio that moved money on the date is never dropped -
-    the spreadsheet these rows feed is a record of that day's postings.
+    Derived from the line map rather than hardcoded, so a property that renamed
+    ``room_revenue_transaction_type`` still selects. Hardcoding
+    ``Room Charge`` here would make the report silently empty on such a site.
     """
-    active = get_reservations_with_activity(on_date)
+    return {transaction_type for transaction_type, line in line_map.items()
+            if line == LINE_ROOM}
 
-    query = """
-        select ir.name, ir.status, ir.customer_id, ir.room_type, ir.bed_type,
-               ir.actual_room_id, ir.channel, ir.actual_room_rate,
-               folio.name as folio, folio.bill_instructions
-        from `tabInn Reservation` as ir
-        left join `tabInn Folio` as folio on folio.reservation_id = ir.name
-        where
-            (ir.status = %s and ir.expected_arrival <= %s)
-            or (ir.status = %s and ir.expected_arrival <= %s and ir.expected_departure > %s)
+
+def get_folio_rows(on_date, line_map):
+    """One row source per folio that was charged room revenue on ``on_date``.
+
+    Selection is **folio-based**, not reservation-based, and it is driven by a
+    posted room charge rather than by occupancy or by any transaction at all.
+    Two consequences are deliberate:
+
+    * A stay cannot appear on its departure date merely because a late-checkout
+      fee or a settling payment was posted that day. One night, one row.
+    * Master and Desk folios carrying room charges are still selected. They have
+      no ``reservation_id``, so a reservation-driven query drops their revenue
+      silently -- 28,670,061 over three days on one Jakarta master folio.
+
+    A folio with a reservation renders the reservation; one without renders
+    itself. See :func:`resolve_folio_row`.
     """
-    params = [
-        STATUS_IN_HOUSE,
-        on_date,
-        STATUS_FINISH,
-        on_date,
-        on_date,
-    ]
+    room_types = sorted(get_room_line_types(line_map))
+    if not room_types:
+        return []
 
-    if active:
-        query += " or ir.name in ({0})".format(", ".join(["%s"] * len(active)))
-        params.extend(active)
-
-    query += " order by ir.name"
-
-    return frappe.db.sql(query, tuple(params), as_dict=True)
-
-
-def get_reservations_with_activity(on_date):
+    placeholders = ", ".join(["%s"] * len(room_types))
     rows = frappe.db.sql(
         """
-        select distinct folio.reservation_id
-        from `tabInn Folio Transaction` as trx
-        inner join `tabInn Folio` as folio on folio.name = trx.parent
+        select folio.name as folio, folio.type as folio_type,
+               folio.customer_id as folio_customer_id,
+               folio.channel as folio_channel,
+               folio.bill_instructions as folio_bill_instructions,
+               ir.name as reservation, ir.customer_id as customer_id,
+               ir.room_type as room_type, ir.bed_type as bed_type,
+               ir.actual_room_id as actual_room_id, ir.channel as channel
+        from `tabInn Folio` as folio
+        inner join `tabInn Folio Transaction` as trx on trx.parent = folio.name
+        left join `tabInn Reservation` as ir on ir.name = folio.reservation_id
         where trx.audit_date = %s
           and trx.is_void = 0
-          and folio.reservation_id is not null
-          and folio.reservation_id != ''
-        """,
-        (on_date,),
-    )
-    return [row[0] for row in rows]
-
-
-def get_folios_without_reservation(on_date):
-    """Folios that moved money on ``on_date`` but belong to no reservation.
-
-    ``Inn Folio.type`` is ``Guest``, ``Master`` or ``Desk``. Desk and Master
-    folios carry no ``reservation_id``, so a reservation-driven report silently
-    drops their money - 912,500 of one November on the Bandung bench. They are
-    emitted as their own rows so the day's collections still tie out.
-    """
-    return frappe.db.sql(
-        """
-        select folio.name, folio.type, folio.customer_id, folio.channel,
-               folio.bill_instructions
-        from `tabInn Folio Transaction` as trx
-        inner join `tabInn Folio` as folio on folio.name = trx.parent
-        left join `tabInn Reservation` as res on res.name = folio.reservation_id
-        where trx.audit_date = %s
-          and trx.is_void = 0
-          and res.name is null
+          and trx.transaction_type in ({0})
         group by folio.name, folio.type, folio.customer_id, folio.channel,
-                 folio.bill_instructions
+                 folio.bill_instructions, ir.name, ir.customer_id, ir.room_type,
+                 ir.bed_type, ir.actual_room_id, ir.channel
         order by folio.name
-        """,
-        (on_date,),
+        """.format(placeholders),
+        tuple([on_date] + room_types),
         as_dict=True,
+    )
+
+    return [resolve_folio_row(row) for row in rows]
+
+
+def resolve_folio_row(row):
+    """Turn one selected folio into the row source :func:`build_row` expects.
+
+    Same 17 columns either way. A folio with no reservation puts its own name
+    in ``rsv`` so the row stays traceable, and states its type in ``remark``.
+
+    ``bill_instructions`` is the *folio's* field on both branches --
+    ``Inn Reservation`` has no such column, and the remark has always been the
+    folio's instruction.
+    """
+    if row.reservation:
+        return frappe._dict(
+            folio=row.folio,
+            name=row.reservation,
+            customer_id=row.customer_id,
+            room_type=row.room_type,
+            bed_type=row.bed_type,
+            actual_room_id=row.actual_room_id,
+            channel=row.channel,
+            bill_instructions=row.folio_bill_instructions,
+        )
+
+    remark = "{0} folio {1}".format(row.folio_type or "Non-guest", row.folio)
+    if row.folio_bill_instructions:
+        remark = "{0}: {1}".format(remark, row.folio_bill_instructions)
+
+    return frappe._dict(
+        folio=row.folio,
+        name=row.folio,
+        customer_id=row.folio_customer_id,
+        room_type="",
+        bed_type="",
+        actual_room_id="",
+        channel=row.folio_channel,
+        bill_instructions=remark,
     )
 
 
@@ -431,33 +438,6 @@ def warn_unmapped_types(unmapped):
         ),
         title="Unmapped transaction types",
         indicator="orange",
-    )
-
-
-def build_orphan_row(folio, detail, settlement_status, is_show_mode_payment, on_date):
-    """Row for a Desk/Master folio that has no reservation.
-
-    ``rsv`` carries the folio name so the row stays traceable, and the folio
-    type is stated in the remark. Same 16 columns as every other row.
-    """
-    remark = "{0} folio {1}".format(folio.type or "Non-guest", folio.name)
-    if folio.bill_instructions:
-        remark = "{0}: {1}".format(remark, folio.bill_instructions)
-
-    return build_row(
-        frappe._dict(
-            name=folio.name,
-            customer_id=folio.customer_id,
-            room_type="",
-            bed_type="",
-            actual_room_id="",
-            channel=folio.channel,
-            bill_instructions=remark,
-        ),
-        detail,
-        settlement_status,
-        is_show_mode_payment,
-        on_date,
     )
 
 
