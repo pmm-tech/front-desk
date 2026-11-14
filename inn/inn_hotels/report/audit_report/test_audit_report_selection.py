@@ -76,7 +76,8 @@ def make_folio(folio_type="Guest", reservation=None, customer="TEST-CUST",
 
 
 def add_transaction(folio, transaction_type, flag, amount, audit_date,
-                    mode_of_payment=None, is_void=0, actual_room_rate=None):
+                    mode_of_payment=None, is_void=0, actual_room_rate=None,
+                    remark=None):
     folio.flags.ignore_links = True
     folio.append("folio_transaction", {
         "transaction_type": transaction_type,
@@ -86,6 +87,7 @@ def add_transaction(folio, transaction_type, flag, amount, audit_date,
         "mode_of_payment": mode_of_payment,
         "is_void": is_void,
         "actual_room_rate": actual_room_rate,
+        "remark": remark,
     })
     folio.save(ignore_permissions=True)
     return folio
@@ -385,3 +387,64 @@ class TestMoneyColumns(FrappeTestCase):
         reservation, _ = self.charge_folio(taxes=())
 
         self.assertEqual(cell(self.only_row(reservation.name), "paid_date"), "")
+
+
+class TestTransferredCharges(FrappeTestCase):
+    """A stay whose charges were transferred away still produces a row.
+
+    ``transfer_to_another_folio()`` re-parents the rows onto the receiving folio
+    and leaves a ``Transferred from ...`` remark behind, so the original folio
+    holds nothing at all. That is how group bookings work on Jakarta: RSV-26707's
+    six rows sit on F-27548 and its own folio F-27547 is empty.
+
+    The stay must still appear, with zeros, because that zero is how the desk
+    sees that the charge went elsewhere. Omitting the row hides the stay
+    entirely, which is worse than showing it with no money.
+    """
+
+    def rows_for(self, name, on_date=NIGHT):
+        return [row for row in audit_report.get_data_detail(on_date, 1)
+                if rsv(row) == name]
+
+    def transferred_stay(self):
+        reservation = make_reservation()
+        own_folio = make_folio(reservation=reservation.name)
+        receiving = make_folio(folio_type="Master")
+        add_transaction(
+            receiving, "Room Charge", "Debit", 260763, NIGHT, actual_room_rate=376953,
+            remark="Transferred from {0} to Folio {1}".format(
+                own_folio.name, receiving.name))
+        return reservation, own_folio, receiving
+
+    def test_a_transferred_stay_still_appears_with_zero_money(self):
+        reservation, _, _ = self.transferred_stay()
+
+        rows = self.rows_for(reservation.name)
+
+        self.assertEqual(len(rows), 1, "the stay must stay visible")
+        self.assertEqual(cell(rows[0], "actual_room_rate"), 0)
+        self.assertEqual(cell(rows[0], "actual_room_nett"), 0)
+        self.assertEqual(cell(rows[0], "total_amount"), 0)
+
+    def test_the_receiving_folio_keeps_the_money(self):
+        _, _, receiving = self.transferred_stay()
+
+        received = self.rows_for(receiving.name)
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(cell(received[0], "total_amount"), 260763)
+
+    def test_a_charged_stay_is_not_emitted_twice(self):
+        reservation = make_reservation()
+        folio = make_folio(reservation=reservation.name)
+        add_transaction(folio, "Room Charge", "Debit", 260763, NIGHT)
+
+        self.assertEqual(len(self.rows_for(reservation.name)), 1)
+
+    def test_a_no_show_is_not_an_occupant(self):
+        """Occupancy is not status-only: the stay must cover the night."""
+        reservation = make_reservation(status="No Show", arrival=NIGHT,
+                                       departure=DEPARTURE)
+        make_folio(reservation=reservation.name)
+
+        self.assertEqual(self.rows_for(reservation.name), [])

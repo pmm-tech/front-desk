@@ -158,17 +158,21 @@ def get_data_detail(on_date, is_show_mode_payment=True):
     line_map = get_line_map(context)
     tax_service_types = get_tax_service_types(context)
 
-    rows = get_folio_rows(on_date, line_map)
+    charged = get_folio_rows(on_date, line_map)
+    rows = charged + get_occupancy_rows(on_date, {row.folio for row in charged})
     if not rows:
         return []
 
-    folio_names = [row.folio for row in rows]
-    transactions = get_transactions_for_date(folio_names, on_date)
+    # A reservation with no folio at all still gets a row, so ``folio`` can be
+    # None here; the transaction lookups below are keyed by folio and skip it.
+    folio_names = [row.folio for row in rows if row.folio]
+
+    transactions = get_transactions_for_date(folio_names, on_date) if folio_names else []
     detail, unmapped = summarise_transactions(transactions, line_map, tax_service_types)
     warn_unmapped_types(unmapped)
     warn_unrecognised_tax_service_types(transactions, tax_service_types, line_map)
 
-    settlement = get_settlement_status(folio_names, on_date)
+    settlement = get_settlement_status(folio_names, on_date) if folio_names else {}
     modes = get_payment_modes(folio_names)
     paid_dates = get_paid_dates(folio_names)
 
@@ -278,6 +282,59 @@ def resolve_folio_row(row):
         channel=row.folio_channel,
         bill_instructions=remark,
     )
+
+
+def get_occupancy_rows(on_date, charged_folios):
+    """Reservations expected to occupy a room that night, minus the charged.
+
+    ``transfer_to_another_folio()`` **re-parents** a folio's rows onto the
+    receiving folio, leaving the original empty with only a ``Transferred
+    from ...`` remark behind. A group booking's member rooms therefore hold no
+    charge of their own, and a room-charge selection cannot see them at all --
+    on Jakarta that is RSV-26707, whose six rows sit on F-27548 while its own
+    folio F-27547 is empty.
+
+    They are emitted anyway, with zero money. The desk reads that zero as "the
+    charge went to another folio"; omitting the row hides the stay entirely,
+    which is worse than showing it with no money.
+
+    ``charged_folios`` are skipped, so a stay charged on its own folio is not
+    emitted twice.
+
+    The predicate is **occupancy** -- the report date inside the expected stay
+    -- and deliberately not activity. Re-adding a reservation because it had
+    some transaction that day is what put RSV-26612 on its own departure date.
+    """
+    rows = frappe.db.sql(
+        """
+        select ir.name, ir.customer_id, ir.room_type, ir.bed_type,
+               ir.actual_room_id, ir.channel, folio.name as folio,
+               folio.bill_instructions
+        from `tabInn Reservation` as ir
+        left join `tabInn Folio` as folio on folio.reservation_id = ir.name
+        where
+            (ir.status = %s and ir.expected_arrival <= %s)
+            or (ir.status = %s and ir.expected_arrival <= %s and ir.expected_departure > %s)
+        order by ir.name
+        """,
+        (STATUS_IN_HOUSE, on_date, STATUS_FINISH, on_date, on_date),
+        as_dict=True,
+    )
+
+    return [
+        frappe._dict(
+            folio=row.folio,
+            name=row.name,
+            customer_id=row.customer_id,
+            room_type=row.room_type,
+            bed_type=row.bed_type,
+            actual_room_id=row.actual_room_id,
+            channel=row.channel,
+            bill_instructions=row.bill_instructions,
+        )
+        for row in rows
+        if row.folio not in charged_folios
+    ]
 
 
 def get_transactions_for_date(folio_names, on_date):

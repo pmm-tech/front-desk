@@ -602,12 +602,18 @@ class TestAuditReportRowShaping(unittest.TestCase):
 
 
 class TestAuditReportFolioDrivenRows(unittest.TestCase):
-    """Rows come from folios carrying a room charge, and only from those.
+    """Rows come from charged folios and occupied rooms, and from nothing else.
 
-    The report used to select reservations -- in house, plus any with activity
-    that day -- and then look up each one's folio. It now selects folios
-    directly, so a reservation with no folio can no longer produce a row. That
-    is the point: a stay with no room charge is not a room charge.
+    Two sources, deliberately:
+
+    * folios charged room revenue on the date -- the ledger;
+    * reservations that occupied a room that night but hold no charge of their
+      own, because ``transfer_to_another_folio()`` re-parented it to another
+      folio. A group booking's member rooms are all like this, and the desk
+      reads the zero on such a row as "the charge went elsewhere".
+
+    What is gone is the **activity** branch: a stay is no longer re-added on its
+    departure date merely because a late-checkout fee was posted that day.
     """
 
     def folio_row(self, folio, name=None):
@@ -617,18 +623,27 @@ class TestAuditReportFolioDrivenRows(unittest.TestCase):
             bill_instructions=None,
         )
 
-    def test_no_selected_folios_produces_no_rows(self):
-        with mock.patch.object(audit_report, "get_folio_rows", return_value=[]):
-            self.assertEqual(audit_report.get_data_detail(ON_DATE, 1), [])
+    def rows_for(self, charged=(), occupants=(), transactions=None,
+                 modes=None, settlement=None, paid_dates=None):
+        with mock.patch.object(audit_report, "get_folio_rows", return_value=list(charged)), \
+                mock.patch.object(audit_report, "get_occupancy_rows",
+                                  return_value=list(occupants)), \
+                mock.patch.object(audit_report, "get_transactions_for_date",
+                                  return_value=transactions or []), \
+                mock.patch.object(audit_report, "get_settlement_status",
+                                  return_value=settlement or {}), \
+                mock.patch.object(audit_report, "get_payment_modes",
+                                  return_value=modes or {}), \
+                mock.patch.object(audit_report, "get_paid_dates",
+                                  return_value=paid_dates or {}):
+            return audit_report.get_data_detail(ON_DATE, 1)
 
-    def test_one_row_is_emitted_per_selected_folio(self):
-        rows = [self.folio_row("F-1", "RSV-1"), self.folio_row("F-2", "RSV-2")]
+    def test_nothing_charged_and_nobody_in_house_produces_no_rows(self):
+        self.assertEqual(self.rows_for(), [])
 
-        with mock.patch.object(audit_report, "get_folio_rows", return_value=rows), \
-                mock.patch.object(audit_report, "get_transactions_for_date", return_value=[]), \
-                mock.patch.object(audit_report, "get_settlement_status", return_value={}), \
-                mock.patch.object(audit_report, "get_payment_modes", return_value={}):
-            out = audit_report.get_data_detail(ON_DATE, 1)
+    def test_one_row_is_emitted_per_charged_folio(self):
+        out = self.rows_for(charged=[self.folio_row("F-1", "RSV-1"),
+                                     self.folio_row("F-2", "RSV-2")])
 
         self.assertEqual(len(out), 2)
         self.assertEqual([row_value(row, "rsv") for row in out], ["RSV-1", "RSV-2"])
@@ -636,30 +651,92 @@ class TestAuditReportFolioDrivenRows(unittest.TestCase):
             self.assertEqual(len(row), len(audit_report.get_columns()))
             self.assertEqual(row_value(row, "audit_date"), ON_DATE)
 
-    def test_every_selected_folio_is_queried_for_its_transactions(self):
-        rows = [self.folio_row("F-1"), self.folio_row("F-2")]
+    def test_an_occupant_holding_no_charge_is_appended(self):
+        out = self.rows_for(charged=[self.folio_row("F-1", "RSV-1")],
+                            occupants=[self.folio_row("F-2", "RSV-2")])
 
-        with mock.patch.object(audit_report, "get_folio_rows", return_value=rows), \
+        self.assertEqual([row_value(row, "rsv") for row in out], ["RSV-1", "RSV-2"])
+        self.assertEqual(row_value(out[1], "total_amount"), 0)
+        self.assertEqual(row_value(out[1], "actual_room_rate"), 0)
+
+    def test_occupancy_selection_is_told_which_folios_were_charged(self):
+        with mock.patch.object(audit_report, "get_folio_rows",
+                               return_value=[self.folio_row("F-1")]), \
+                mock.patch.object(audit_report, "get_occupancy_rows",
+                                  return_value=[]) as occupants, \
+                mock.patch.object(audit_report, "get_transactions_for_date", return_value=[]), \
+                mock.patch.object(audit_report, "get_settlement_status", return_value={}), \
+                mock.patch.object(audit_report, "get_payment_modes", return_value={}), \
+                mock.patch.object(audit_report, "get_paid_dates", return_value={}):
+            audit_report.get_data_detail(ON_DATE, 1)
+
+        self.assertEqual(occupants.call_args[0][1], {"F-1"})
+
+    def test_every_selected_folio_is_queried_for_its_transactions(self):
+        with mock.patch.object(audit_report, "get_folio_rows",
+                               return_value=[self.folio_row("F-1"), self.folio_row("F-2")]), \
+                mock.patch.object(audit_report, "get_occupancy_rows", return_value=[]), \
                 mock.patch.object(audit_report, "get_transactions_for_date",
                                   return_value=[]) as transactions, \
                 mock.patch.object(audit_report, "get_settlement_status", return_value={}), \
-                mock.patch.object(audit_report, "get_payment_modes", return_value={}):
+                mock.patch.object(audit_report, "get_payment_modes", return_value={}), \
+                mock.patch.object(audit_report, "get_paid_dates", return_value={}):
             audit_report.get_data_detail(ON_DATE, 1)
 
         self.assertEqual(sorted(transactions.call_args[0][0]), ["F-1", "F-2"])
         self.assertEqual(transactions.call_args[0][1], ON_DATE)
 
-    def test_the_folios_payment_modes_reach_the_row(self):
-        rows = [self.folio_row("F-1", "RSV-1")]
-
-        with mock.patch.object(audit_report, "get_folio_rows", return_value=rows), \
-                mock.patch.object(audit_report, "get_transactions_for_date", return_value=[]), \
+    def test_a_charged_folio_is_still_queried_when_it_holds_an_occupant(self):
+        """The charged row must not be lost to the occupancy pass."""
+        with mock.patch.object(audit_report, "get_folio_rows",
+                               return_value=[self.folio_row("F-1", "RSV-1")]), \
+                mock.patch.object(audit_report, "get_occupancy_rows", return_value=[]), \
+                mock.patch.object(audit_report, "get_transactions_for_date",
+                                  return_value=[]) as transactions, \
                 mock.patch.object(audit_report, "get_settlement_status", return_value={}), \
-                mock.patch.object(audit_report, "get_payment_modes",
-                                  return_value={"F-1": ["City Ledger", "BCA QRIS"]}):
-            out = audit_report.get_data_detail(ON_DATE, 1)
+                mock.patch.object(audit_report, "get_payment_modes", return_value={}), \
+                mock.patch.object(audit_report, "get_paid_dates", return_value={}):
+            audit_report.get_data_detail(ON_DATE, 1)
+
+        self.assertEqual(transactions.call_args[0][0], ["F-1"])
+
+    def test_the_folios_payment_modes_reach_the_row(self):
+        out = self.rows_for(charged=[self.folio_row("F-1", "RSV-1")],
+                            modes={"F-1": ["City Ledger", "BCA QRIS"]})
 
         self.assertEqual(row_value(out[0], "mode_of_payment"), "City Ledger, BCA QRIS")
+
+
+class TestOccupancySelection(unittest.TestCase):
+    """The predicate for stays that hold no charge of their own."""
+
+    def selected(self, rows, charged=frozenset()):
+        with mock.patch.object(frappe.db, "sql", return_value=rows) as sql:
+            return audit_report.get_occupancy_rows(ON_DATE, set(charged)), sql.call_args
+
+    def occupant(self, folio, name):
+        return frappe._dict(folio=folio, name=name, customer_id="CUST-1",
+                            room_type="Superior", bed_type="Double",
+                            actual_room_id="R-605", channel="TIKET.COM",
+                            bill_instructions=None)
+
+    def test_an_occupant_holding_no_charge_is_selected(self):
+        out, _ = self.selected([self.occupant("F-1", "RSV-1")])
+        self.assertEqual([row.name for row in out], ["RSV-1"])
+
+    def test_an_occupant_whose_folio_was_charged_is_not_repeated(self):
+        out, _ = self.selected([self.occupant("F-1", "RSV-1")], charged={"F-1"})
+        self.assertEqual(out, [])
+
+    def test_the_query_selects_on_occupancy_not_activity(self):
+        """The activity branch is what produced the phantom rows. It stays gone."""
+        _, call = self.selected([])
+        query, params = call[0]
+
+        self.assertNotIn("Inn Folio Transaction", query)
+        self.assertIn("expected_departure > %s", query)
+        self.assertIn(audit_report.STATUS_IN_HOUSE, params)
+        self.assertIn(audit_report.STATUS_FINISH, params)
 
 
 class TestRoomLineTypes(unittest.TestCase):
