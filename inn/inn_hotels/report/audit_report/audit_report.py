@@ -18,44 +18,55 @@ truth for that order.
 
 What each row means
 -------------------
-One row per reservation that is in house on the report date, plus any
-reservation that has non-void activity on that date. Money columns aggregate
-only the transactions whose ``audit_date`` equals the report date.
+One row per folio that was **charged room revenue** on the report date, whether
+or not it belongs to a reservation. A stay therefore appears once per night
+charged, and never on its departure date merely because a late-checkout fee or
+a settling payment happened to be posted that day.
+
+The money columns describe the room charge, not the day's takings:
+
+* ``total_amount`` is the **gross** room charge posted on the date -- the charge
+  plus its ``Room Charge Tax/Service`` rows.
+* ``actual_room_nett`` is that charge without the tax/service rows.
+* ``bf_revenue`` and ``comission`` are always 0. Breakfast, commission and every
+  other non-room line are out of scope: ``Front Desk Daily Revenue Recap``
+  carries them, with the tax split, as a strict superset.
+
+``mode_of_payment`` and ``paid_date`` are the exception to the date scoping.
+Both span the whole folio, so a night settled at checkout still shows how and
+when it was paid. That makes the report **non-reproducible for a past date**:
+re-running 2026-11-07 later shows modes and a first payment added after it.
 
 Fixed relative to the previous implementation
 ---------------------------------------------
 ``audit_date``      every row is dateable; the report date is no longer implied
                     by the filter used at export time.
-``total_amount``    now every non-void credit, so ``Down Payment``, ``Payment``
-                    and ``Deposit`` collections are no longer dropped. The old
-                    code used two Inn Hotels Setting fields that were both
-                    ``Room Payment``.
 ``status``          was always empty; now Paid / Partial / Unpaid as at the
                     report date, reconstructed from ``audit_date <= date``.
 ``mode_of_payment`` was a sliced concatenation (``[:-2]``); now clean,
-                    comma-joined Mode of Payment values.
-``paid_date``       was always empty; now the earliest payment date.
-``actual_room_nett`` / ``bf_revenue``
+                    comma-joined Mode of Payment values, in payment order.
+``paid_date``       was always empty; now the earliest payment date on the
+                    folio, at any date.
+``actual_room_nett``
                     now **nett**, not gross. The v1.2.0 refactor replaced
                     exact transaction-type matching with line classification,
                     which folded ``Room Charge Tax/Service`` into ``Room
-                    Charge`` and silently turned both columns into gross --
-                    room overstated 20%, breakfast 21% on the date this was
-                    found. The split now uses
-                    :func:`inn.helper.revenue_lines.get_tax_service_types`.
+                    Charge`` and silently turned the column into gross -- room
+                    overstated 20% on the date this was found. The split now
+                    uses :func:`inn.helper.revenue_lines.get_tax_service_types`.
 ``remark``          unchanged (``Inn Folio.bill_instructions``).
 
-Two things the nett columns deliberately do **not** do:
+The nett column deliberately does **not**:
 
-* They never apply a tax rate. ``Inn Tax`` may be ``No Service Tax``,
-  ``Service Only (10%)`` or ``Service Tax 21%``, and a posting may carry only
-  one of a tax's breakdown rows, so the posted tax/service rows are subtracted
-  rather than any percentage of the gross.
-* They never read ``Inn Reservation.nett_actual_room_rate``. That field is a
-  single current scalar, not a per-night history -- it is rewritten on room
-  move and by ``recalculate_nett_charge()`` -- and it disagrees with what was
-  posted on roughly 15% of room-charge folio-days. The posted transactions are
-  the source of truth for a business date.
+* apply a tax rate. ``Inn Tax`` may be ``No Service Tax``, ``Service Only
+  (10%)`` or ``Service Tax 21%``, and a posting may carry only one of a tax's
+  breakdown rows, so the posted tax/service rows are subtracted rather than any
+  percentage of the gross.
+* read ``Inn Reservation.nett_actual_room_rate``. That field is a single
+  current scalar, not a per-night history -- it is rewritten on room move and by
+  ``recalculate_nett_charge()`` -- and it disagrees with what was posted on
+  roughly 15% of room-charge folio-days. The posted transactions are the source
+  of truth for a business date.
 
 The payment classification rules live in ``inn.helper.revenue_lines`` so this
 report and ``Front Desk Daily Revenue Recap`` cannot disagree.
@@ -159,11 +170,12 @@ def get_data_detail(on_date, is_show_mode_payment=True):
 
     settlement = get_settlement_status(folio_names, on_date)
     modes = get_payment_modes(folio_names)
+    paid_dates = get_paid_dates(folio_names)
 
     return [
         build_row(row, detail.get(row.folio) or empty_detail(),
                   settlement.get(row.folio, ""), is_show_mode_payment, on_date,
-                  modes.get(row.folio))
+                  modes=modes.get(row.folio), paid_date=paid_dates.get(row.folio))
         for row in rows
     ]
 
@@ -329,6 +341,38 @@ def get_payment_modes(folio_names):
     return modes
 
 
+def get_paid_dates(folio_names):
+    """Earliest payment date per folio, across every ``audit_date``.
+
+    Not date-scoped, for the same reason as the mode list: the column answers
+    "when did this guest pay", so a row for a night settled at checkout must
+    carry that later payment.
+
+    The filter is deliberately **wider** than :func:`get_payment_modes`': a
+    credit posted with no Mode of Payment is still money received, so it dates
+    the payment even though it contributes no mode.
+    """
+    if not folio_names:
+        return {}
+
+    placeholders = ", ".join(["%s"] * len(folio_names))
+    rows = frappe.db.sql(
+        """
+        select parent, min(creation) as first_payment
+        from `tabInn Folio Transaction`
+        where parent in ({0})
+          and is_void = 0
+          and lower(flag) = 'credit'
+        group by parent
+        """.format(placeholders),
+        tuple(folio_names),
+        as_dict=True,
+    )
+
+    return {row.parent: row.first_payment.date().isoformat()
+            for row in rows if row.first_payment}
+
+
 def get_settlement_status(folio_names, on_date):
     """Paid / Partial / Unpaid per folio, as at ``on_date``.
 
@@ -372,10 +416,12 @@ def empty_detail():
     return {
         "actual_room_rate": 0,
         "actual_room_nett": 0,
+        # Kept so the dead columns are explicit rather than absent. Nothing
+        # accumulates them: breakfast and commission are out of scope.
         "breakfast_revenue": 0,
         "comission": 0,
         "total_amount": 0,
-        "creations": [],
+        "room_postings": [],
     }
 
 
@@ -387,46 +433,42 @@ def summarise_transactions(transactions, line_map, tax_service_types):
     and report gross as nett -- which is precisely the defect this signature
     exists to prevent. Making it required turns that mistake into a
     ``TypeError`` at the call site instead of a plausible wrong number.
+
+    Only **room-line debits** feed a column. Credits, breakfast and commission
+    are deliberately ignored: this is a room-charge ledger, and Front Desk Daily
+    Revenue Recap carries collections and non-room revenue as a strict superset.
+    Mode of Payment is likewise not collected here -- it is a folio-level fact
+    spanning every date; see :func:`get_payment_modes`.
     """
     detail = {}
     charge_types = set()
 
     for trx in transactions:
         bucket = detail.setdefault(trx.parent, empty_detail())
-        amount = flt(trx.amount)
 
-        # Collections: every credit is money received (payment types are not
-        # revenue lines and are deliberately not classified). Refunds are debits
-        # in this app, so they are naturally excluded.
-        #
-        # Mode of Payment is NOT collected here: it is a folio-level fact
-        # spanning every date, resolved by get_payment_modes(). Collecting it
-        # from one date's rows is what scoped the column to that date.
         if (trx.flag or "").strip().lower() == "credit":
-            bucket["total_amount"] += amount
-            if trx.creation:
-                bucket["creations"].append(trx.creation)
             continue
 
+        # Recorded before the room-line filter so a newly introduced charge type
+        # is still reported as unmapped rather than silently ignored.
         charge_types.add(trx.transaction_type)
-        line = classify(trx.transaction_type, line_map)
+        if classify(trx.transaction_type, line_map) != LINE_ROOM:
+            continue
 
-        # The tax/service element of a revenue line shares that line, so it must
-        # be excluded by type. Subtracting a percentage of the gross would be
-        # wrong: the rate varies per reservation and a posting may carry only
-        # one of a tax's breakdown rows.
+        amount = flt(trx.amount)
         is_tax_service = trx.transaction_type in tax_service_types
 
-        if line == LINE_ROOM:
-            if not is_tax_service:
-                bucket["actual_room_nett"] += amount
-            if trx.actual_room_rate:
-                bucket["actual_room_rate"] = flt(trx.actual_room_rate)
-        elif line == LINE_BREAKFAST:
-            if not is_tax_service:
-                bucket["breakfast_revenue"] += amount
-        elif line == LINE_COMMISSION:
-            bucket["comission"] += amount
+        # Total Amount is the **gross** room charge -- every room-line debit,
+        # the tax and service rows included. The nett column excludes them.
+        # Subtracting a percentage instead would be wrong: the rate varies per
+        # reservation and a posting may carry only one of a tax's breakdown rows.
+        bucket["total_amount"] += amount
+        if not is_tax_service:
+            bucket["actual_room_nett"] += amount
+        if trx.actual_room_rate:
+            bucket["actual_room_rate"] = flt(trx.actual_room_rate)
+        if trx.creation:
+            bucket["room_postings"].append(trx.creation)
 
     # Only charge types can be "unmapped"; a payment type has no revenue line by
     # design and must not be reported as a gap.
@@ -489,8 +531,14 @@ def warn_unmapped_types(unmapped):
 
 
 def build_row(reservation, detail, settlement_status, is_show_mode_payment, on_date,
-              modes=None):
-    creations = detail.get("creations") or []
+              modes=None, paid_date=None):
+    """Emit one row, in ``ROW_FIELDS`` order.
+
+    ``modes`` and ``paid_date`` are folio-level facts spanning every date, so
+    they are passed in rather than derived from ``detail``, which describes the
+    report date alone.
+    """
+    postings = detail.get("room_postings") or []
     # ``modes`` is already in payment order; joining preserves it. Sorting here
     # would report the alphabet's order rather than the guest's.
     mode_of_payment = ", ".join(modes or []) if is_show_mode_payment else ""
@@ -509,8 +557,9 @@ def build_row(reservation, detail, settlement_status, is_show_mode_payment, on_d
         settlement_status,
         mode_of_payment,
         detail.get("total_amount", 0),
-        ", ".join(str(creation) for creation in creations),
-        creations[0].date().isoformat() if creations else "",
+        # When the charge was posted, oldest first -- not when it was paid.
+        ", ".join(str(posting) for posting in postings),
+        paid_date or "",
         reservation.bill_instructions,
         on_date,
     ]

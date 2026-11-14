@@ -127,8 +127,14 @@ class TestAuditReportColumns(unittest.TestCase):
 
 
 class TestAuditReportAggregation(unittest.TestCase):
-    def test_every_credit_counts_as_collection(self):
-        """Regression: Down Payment / Payment / Deposit used to be dropped."""
+    def test_credits_no_longer_feed_total_amount(self):
+        """Total Amount is the gross room charge now, not the day's collections.
+
+        The regression this replaces -- Down Payment / Payment / Deposit being
+        dropped from the old collections total -- still matters, but it belongs
+        to Front Desk Daily Revenue Recap, which owns collections. Here the
+        money columns describe the room charge.
+        """
         detail, _ = audit_report.summarise_transactions(
             [
                 trx("Room Payment", "Credit", 100, mode="Cash"),
@@ -139,20 +145,42 @@ class TestAuditReportAggregation(unittest.TestCase):
             LINE_MAP,
             TAX_SERVICE_TYPES,
         )
-        self.assertEqual(detail["F-1"]["total_amount"], 1000)
+        self.assertEqual(detail["F-1"]["total_amount"], 0)
 
-    def test_debits_are_not_collections(self):
+    def test_total_amount_is_the_gross_room_charge(self):
+        """Gross: the charge plus its posted tax/service. Nothing else."""
         detail, _ = audit_report.summarise_transactions(
             [
                 trx("Room Charge", "Debit", 500),
+                trx("Room Charge Tax/Service", "Debit", 105),
                 trx("Refund", "Debit", 50),
                 trx("Room Payment", "Credit", 500, mode="Cash"),
             ],
             LINE_MAP,
             TAX_SERVICE_TYPES,
         )
-        self.assertEqual(detail["F-1"]["total_amount"], 500)
+        self.assertEqual(detail["F-1"]["total_amount"], 605)
         self.assertEqual(detail["F-1"]["actual_room_nett"], 500)
+
+    def test_gross_is_nett_plus_the_posted_tax_service(self):
+        """The relationship the two columns must hold, on RSV-26612's numbers.
+
+        Jakarta posted 260,763 nett with two tax/service rows of 26,076 and
+        28,685 -- 315,524 gross, which is exactly the reservation's rate.
+        """
+        detail, _ = audit_report.summarise_transactions(
+            [
+                trx("Room Charge", "Debit", 260763),
+                trx("Room Charge Tax/Service", "Debit", 26076),
+                trx("Room Charge Tax/Service", "Debit", 28685),
+            ],
+            LINE_MAP,
+            TAX_SERVICE_TYPES,
+        )
+        bucket = detail["F-1"]
+        self.assertEqual(bucket["actual_room_nett"], 260763)
+        self.assertEqual(bucket["total_amount"], 315524)
+        self.assertEqual(bucket["total_amount"], 260763 + 26076 + 28685)
 
     def test_refund_is_not_room_revenue(self):
         detail, _ = audit_report.summarise_transactions([trx("Refund", "Debit", 75)], LINE_MAP, TAX_SERVICE_TYPES)
@@ -191,16 +219,25 @@ class TestAuditReportAggregation(unittest.TestCase):
         )
         self.assertEqual(detail["F-1"]["actual_room_nett"], 500)
 
-    def test_tax_service_lines_are_excluded_from_breakfast_nett(self):
+    def test_breakfast_no_longer_reaches_a_column(self):
+        """Breakfast is out of scope: the recap carries it, with the tax split.
+
+        The old test here pinned that breakfast tax/service was excluded from
+        the breakfast nett. Nothing accumulates breakfast now, so there is no
+        nett to exclude it from -- the assertion that matters is that a
+        breakfast posting stays out of the room columns too.
+        """
         detail, _ = audit_report.summarise_transactions(
             [
+                trx("Room Charge", "Debit", 500),
                 trx("Breakfast Charge", "Debit", 80),
                 trx("Breakfast Charge Tax/Service", "Debit", 16.8),
             ],
             LINE_MAP,
             TAX_SERVICE_TYPES,
         )
-        self.assertEqual(detail["F-1"]["breakfast_revenue"], 80)
+        self.assertEqual(detail["F-1"]["breakfast_revenue"], 0)
+        self.assertEqual(detail["F-1"]["total_amount"], 500)
 
     def test_room_nett_follows_the_posted_rows_not_a_tax_rate(self):
         """The tax/service split is not a fixed 21%.
@@ -237,6 +274,9 @@ class TestAuditReportAggregation(unittest.TestCase):
         )
         self.assertEqual(detail["F-1"]["actual_room_nett"], 0)
         self.assertEqual(detail["F-1"]["breakfast_revenue"], 0)
+        # Gross still reflects the posted *room* tax. The breakfast tax is not a
+        # room line, so it stays out of the room columns entirely.
+        self.assertEqual(detail["F-1"]["total_amount"], 121)
 
     def test_tax_service_lines_are_still_recognised(self):
         """The replaced test's real intent, kept.
@@ -254,8 +294,14 @@ class TestAuditReportAggregation(unittest.TestCase):
         )
         self.assertEqual(unmapped, [])
 
-    def test_tax_service_is_not_counted_as_a_collection(self):
-        """Excluding tax/service from nett must not leak it into Total Amount."""
+    def test_tax_service_is_part_of_gross_but_not_of_nett(self):
+        """The two columns must differ by exactly the posted tax/service.
+
+        The old test here asserted the tax did *not* reach Total Amount, because
+        Total Amount was the day's collections and a charge is not a collection.
+        It is the gross room charge now, so the tax belongs in it -- and the
+        nett column must still exclude it.
+        """
         detail, _ = audit_report.summarise_transactions(
             [
                 trx("Room Charge", "Debit", 500),
@@ -264,7 +310,8 @@ class TestAuditReportAggregation(unittest.TestCase):
             LINE_MAP,
             TAX_SERVICE_TYPES,
         )
-        self.assertEqual(detail["F-1"]["total_amount"], 0)
+        self.assertEqual(detail["F-1"]["actual_room_nett"], 500)
+        self.assertEqual(detail["F-1"]["total_amount"], 605)
 
     def test_unrecognised_tax_service_type_is_reported(self):
         """A tax type outside the configured set would silently inflate nett.
@@ -312,11 +359,11 @@ class TestAuditReportAggregation(unittest.TestCase):
         )
         self.assertEqual(detail["F-1"]["actual_room_rate"], 550000)
 
-    def test_commission_is_collected_separately(self):
+    def test_commission_no_longer_reaches_a_column(self):
         detail, _ = audit_report.summarise_transactions(
             [trx("Commision", "Debit", 90)], LINE_MAP, TAX_SERVICE_TYPES
         )
-        self.assertEqual(detail["F-1"]["comission"], 90)
+        self.assertEqual(detail["F-1"]["comission"], 0)
         self.assertEqual(detail["F-1"]["total_amount"], 0)
 
     def test_unmapped_type_is_reported(self):
@@ -344,12 +391,18 @@ class TestAuditReportAggregation(unittest.TestCase):
         )
         self.assertEqual(unmapped, [])
 
-    def test_collections_still_counted_when_classification_skipped(self):
-        """Credits bypass classification, so the credit branch must still run."""
-        detail, _ = audit_report.summarise_transactions(
+    def test_a_credit_alone_yields_no_money_and_no_warning(self):
+        """Credits bypass classification: they fund no column and warn nobody.
+
+        Replaces the old "collections are still counted" test. Collections are
+        no longer this report's business, but the classification bypass still
+        is -- classifying a payment type would warn on every run.
+        """
+        detail, unmapped = audit_report.summarise_transactions(
             [trx("Room Payment", "Credit", 250, mode="BCA EDC")], LINE_MAP, TAX_SERVICE_TYPES
         )
-        self.assertEqual(detail["F-1"]["total_amount"], 250)
+        self.assertEqual(detail["F-1"]["total_amount"], 0)
+        self.assertEqual(unmapped, [])
 
 
 class TestPaymentModes(unittest.TestCase):
@@ -432,22 +485,39 @@ class TestAuditReportRowShaping(unittest.TestCase):
         )
         self.assertEqual(len(row), len(audit_report.get_columns()))
 
-    def test_audit_date_and_paid_date_are_populated(self):
+    def test_posting_date_carries_the_room_charge_postings(self):
         import datetime
 
-        self.detail["creations"] = [
-            datetime.datetime(2025, 11, 6, 0, 30),
-            datetime.datetime(2025, 11, 6, 1, 45),
+        self.detail["room_postings"] = [
+            datetime.datetime(2025, 11, 6, 0, 43, 20),
+            datetime.datetime(2025, 11, 6, 0, 43, 21),
         ]
         row = audit_report.build_row(
-            frappe._dict(name="RSV-1", customer_id="C", room_type="", actual_room_id="",
-                         channel="", bill_instructions=None),
+            frappe._dict(name="RSV-1", customer_id="C", room_type="", bed_type="",
+                         actual_room_id="", channel="", bill_instructions=None),
             self.detail, audit_report.STATUS_PAID, 1, ON_DATE,
         )
         self.assertEqual(row_value(row, "audit_date"), ON_DATE)
-        self.assertEqual(row_value(row, "paid_date"), "2025-11-06")
-        # posting_date keeps the original postings, oldest first
-        self.assertTrue(row_value(row, "posting_date").startswith("2025-11-06 00:30"))
+        # The charge's own posting, oldest first -- not the payments'.
+        self.assertTrue(row_value(row, "posting_date").startswith("2025-11-06 00:43:20"))
+
+    def test_paid_date_comes_from_the_folio_not_the_date(self):
+        """Paid Date spans the folio, so it is passed in, not derived from detail."""
+        row = audit_report.build_row(
+            frappe._dict(name="RSV-1", customer_id="C", room_type="", bed_type="",
+                         actual_room_id="", channel="", bill_instructions=None),
+            self.detail, audit_report.STATUS_PAID, 1, ON_DATE,
+            paid_date="2025-11-09",
+        )
+        self.assertEqual(row_value(row, "paid_date"), "2025-11-09")
+
+    def test_paid_date_is_blank_when_the_folio_has_not_paid(self):
+        row = audit_report.build_row(
+            frappe._dict(name="RSV-1", customer_id="C", room_type="", bed_type="",
+                         actual_room_id="", channel="", bill_instructions=None),
+            self.detail, audit_report.STATUS_UNPAID, 1, ON_DATE,
+        )
+        self.assertEqual(row_value(row, "paid_date"), "")
 
     def test_bed_type_is_emitted_for_a_reservation(self):
         row = audit_report.build_row(

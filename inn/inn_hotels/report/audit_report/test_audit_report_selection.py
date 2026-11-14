@@ -46,14 +46,18 @@ _COLUMN_INDEX = {column["fieldname"]: index
                  for index, column in enumerate(audit_report.get_columns())}
 
 
-def rsv(row):
-    """The RSV column of a report row, resolved by name.
+def cell(row, fieldname):
+    """A report row's value, resolved by column name.
 
     The column order is an interface, so a test that pinned slot numbers would
     have to be rewritten every time a column moved -- which is how a real
     misalignment slips through.
     """
-    return row[_COLUMN_INDEX["rsv"]]
+    return row[_COLUMN_INDEX[fieldname]]
+
+
+def rsv(row):
+    return cell(row, "rsv")
 
 
 def make_folio(folio_type="Guest", reservation=None, customer="TEST-CUST",
@@ -85,6 +89,22 @@ def add_transaction(folio, transaction_type, flag, amount, audit_date,
     })
     folio.save(ignore_permissions=True)
     return folio
+
+
+def set_creation(folio, transaction_type, created):
+    """Force a transaction's wall-clock ``creation``.
+
+    Frappe stamps ``creation`` with the real clock, so every row a fixture
+    inserts in one test shares today's timestamp. Two columns depend on that
+    clock -- ``posting_date`` and ``paid_date`` -- so a fixture that cannot
+    separate their timestamps cannot test them. Real rows carry a creation on
+    their business date, so this makes the fixture more realistic, not less.
+    """
+    name = frappe.db.get_value(
+        "Inn Folio Transaction",
+        {"parent": folio.name, "transaction_type": transaction_type}, "name")
+    frappe.db.set_value("Inn Folio Transaction", name, "creation", created)
+    return created
 
 
 def make_reservation(status="Finish", arrival=NIGHT, departure=DEPARTURE):
@@ -283,3 +303,85 @@ class TestPaymentModeColumn(FrappeTestCase):
         reservation = self.settled_stay("CASH")
 
         self.assertEqual(self.mode_cell(reservation.name, NIGHT, show_modes=0), "")
+
+
+class TestMoneyColumns(FrappeTestCase):
+    """Total Amount is the gross room charge; the dead columns stay zero.
+
+    The report was a record of the day's postings, so Total Amount held the day's
+    collections and Breakfast / Comission held their own revenue. It is now a
+    room-charge ledger: Total Amount holds the charge, and non-room money is
+    Front Desk Daily Revenue Recap's job.
+    """
+
+    def only_row(self, reservation_name, on_date=NIGHT):
+        rows = [row for row in audit_report.get_data_detail(on_date, 1)
+                if rsv(row) == reservation_name]
+        self.assertEqual(len(rows), 1, "expected exactly one row for the stay")
+        return rows[0]
+
+    def charge_folio(self, gross_nett=260763, taxes=(26076, 28685), rate=315524):
+        reservation = make_reservation()
+        folio = make_folio(reservation=reservation.name)
+        add_transaction(folio, "Room Charge", "Debit", gross_nett, NIGHT,
+                        actual_room_rate=rate)
+        for tax in taxes:
+            add_transaction(folio, "Room Charge Tax/Service", "Debit", tax, NIGHT)
+        return reservation, folio
+
+    def test_total_amount_is_the_gross_room_charge(self):
+        reservation, _ = self.charge_folio()
+
+        row = self.only_row(reservation.name)
+
+        self.assertEqual(cell(row, "actual_room_nett"), 260763)
+        self.assertEqual(cell(row, "total_amount"), 315524)
+        self.assertEqual(cell(row, "actual_room_rate"), 315524)
+        self.assertEqual(cell(row, "total_amount"), 260763 + 26076 + 28685)
+
+    def test_a_payment_is_not_in_total_amount(self):
+        reservation, folio = self.charge_folio(taxes=())
+        add_transaction(folio, "Payment", "Credit", 500000, NIGHT,
+                        mode_of_payment="CASH")
+
+        self.assertEqual(cell(self.only_row(reservation.name), "total_amount"), 260763)
+
+    def test_breakfast_and_commission_stay_out_of_the_row(self):
+        reservation, folio = self.charge_folio(taxes=())
+        add_transaction(folio, "Breakfast Charge", "Debit", 72727, NIGHT)
+        add_transaction(folio, "Commision", "Debit", 10000, NIGHT)
+
+        row = self.only_row(reservation.name)
+
+        self.assertEqual(cell(row, "bf_revenue"), 0)
+        self.assertEqual(cell(row, "comission"), 0)
+        self.assertEqual(cell(row, "total_amount"), 260763)
+
+    def test_posting_date_carries_the_charge_posting_not_the_payments(self):
+        reservation, folio = self.charge_folio(taxes=())
+        add_transaction(folio, "Payment", "Credit", 260763, DEPARTURE,
+                        mode_of_payment="CASH")
+        set_creation(folio, "Room Charge", NIGHT + " 00:43:20")
+        charge_created = set_creation(folio, "Payment", DEPARTURE + " 14:49:43")
+
+        posting = cell(self.only_row(reservation.name), "posting_date")
+
+        # Exactly the charge's own posting, when the night audit posted it.
+        # Asserting equality rather than "the payment is absent" is deliberate:
+        # it fails both if the payment's timestamp were appended and if the
+        # date were taken from the payment instead of the charge.
+        self.assertEqual(posting, NIGHT + " 00:43:20")
+        self.assertNotIn(str(charge_created), posting)
+
+    def test_paid_date_scans_the_whole_folio(self):
+        reservation, folio = self.charge_folio(taxes=())
+        add_transaction(folio, "Payment", "Credit", 260763, DEPARTURE,
+                        mode_of_payment="CASH")
+        set_creation(folio, "Payment", DEPARTURE + " 14:49:43")
+
+        self.assertEqual(cell(self.only_row(reservation.name), "paid_date"), DEPARTURE)
+
+    def test_paid_date_is_blank_when_nothing_was_paid(self):
+        reservation, _ = self.charge_folio(taxes=())
+
+        self.assertEqual(cell(self.only_row(reservation.name), "paid_date"), "")
