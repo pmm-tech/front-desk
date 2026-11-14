@@ -1,1 +1,2 @@
 inn.patches.v1_2.fix_overlapping_room_move_bookings
+inn.patches.v1_2.fix_unsynced_room_booking_segments

@@ -44,6 +44,11 @@ def sync_booking_segments_with_reservation(bookings, reservation_status, arrival
 
     Protects multi-segment reservations (created by room moves) from having
     internal segment boundaries overwritten.
+
+    `bookings` MUST be ordered oldest segment first: this function reads the
+    first and last entry as the arrival segment and the active segment. Use
+    get_booking_segments_ordered() to fetch them.
+
     - Status 'Cancel' / 'No Show': Cancels all segments.
     - Status 'Finish': Marks only the last non-canceled segment as Finished and sets its end to departure.
     - Status 'In House':
@@ -124,6 +129,41 @@ def sync_booking_segments_with_reservation(bookings, reservation_status, arrival
                 last_booking.save()
 
 
+def get_booking_segments_ordered(reservation_id):
+    """Return a reservation's Room Booking segments, oldest first.
+
+    The ordering is applied here in Python rather than in the query on purpose.
+    `sync_booking_segments_with_reservation` treats the first and last entry as
+    the arrival segment and the active segment, so ordering is part of this
+    function's contract -- but asking SQL for it means an `order_by` naming the
+    `start` column, and frappe's list-query guard rejects that. sqlparse types
+    the bare word `start` as a DML keyword (SQL's `START TRANSACTION`), and the
+    guard refuses any DML token other than `select`
+    (frappe/model/db_query.py, validate_generated_query). The Desk surfaced the
+    rejection as an "Illegal SQL query" popup after every check-in.
+    """
+    rows = frappe.get_all(
+        'Inn Room Booking',
+        filters={'reference_type': 'Inn Reservation', 'reference_name': reservation_id},
+        fields=['name', 'start', 'creation'],
+    )
+    rows.sort(key=_booking_segment_sort_key)
+    return [frappe.get_doc('Inn Room Booking', row.name) for row in rows]
+
+
+def _booking_segment_sort_key(row):
+    """Order key equivalent to the SQL `order by start asc, creation asc`.
+
+    Both parts are stringified so the key is always comparable. A missing value
+    becomes an empty string, which sorts first -- the same position MySQL gives
+    NULL in an ascending sort.
+    """
+    return (
+        str(getdate(row.start)) if row.start else "",
+        str(row.creation) if row.creation else "",
+    )
+
+
 @frappe.whitelist()
 # Keep the Room Booking valid when Reservation created or updated
 def update_by_reservation(reservation_id):
@@ -136,13 +176,7 @@ def update_by_reservation(reservation_id):
         update_close_by_reservation(reservation_id)
 
     if reservation_doc.status in ['Cancel', 'Finish', 'In House', 'No Show']:
-        booking_names = frappe.get_all(
-            'Inn Room Booking',
-            filters={'reference_type': 'Inn Reservation', 'reference_name': reservation_id},
-            order_by='start asc, creation asc',
-            pluck='name'
-        )
-        bookings = [frappe.get_doc('Inn Room Booking', name) for name in booking_names]
+        bookings = get_booking_segments_ordered(reservation_id)
         if bookings:
             sync_booking_segments_with_reservation(
                 bookings=bookings,
