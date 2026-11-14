@@ -17,6 +17,7 @@ separately -- do not "simplify" this report back to the reservation field.
 
 from __future__ import unicode_literals
 
+import datetime
 import unittest
 from unittest import mock
 
@@ -458,6 +459,43 @@ class TestPaymentModes(unittest.TestCase):
     def test_no_folios_means_no_query(self):
         with mock.patch.object(frappe.db, "sql") as sql:
             self.assertEqual(audit_report.get_payment_modes([]), {})
+        sql.assert_not_called()
+
+
+class TestPaidDates(unittest.TestCase):
+    """Paid Date is a **business** date, so it comes from ``audit_date``.
+
+    Not the wall clock. A payment taken at 00:56 during the night audit is
+    created on one calendar day and audited to the one before; the finance
+    spreadsheet is organised by business date, so that is what the column must
+    carry. RSV-26612's City Ledger payment is exactly this case: created
+    2026-11-08 00:56, audited to 2026-11-07.
+    """
+
+    def paid_from(self, rows):
+        with mock.patch.object(frappe.db, "sql", return_value=list(rows)) as sql:
+            return audit_report.get_paid_dates(["F-1"]), sql.call_args
+
+    def test_the_earliest_business_date_is_returned(self):
+        result, _ = self.paid_from([
+            frappe._dict(parent="F-1", first_payment=datetime.date(2026, 11, 7)),
+        ])
+        self.assertEqual(result["F-1"], "2026-11-07")
+
+    def test_the_query_dates_payments_by_audit_date_not_creation(self):
+        _, call = self.paid_from([])
+        query = call[0][0].lower()
+
+        self.assertIn("min(audit_date)", query)
+        self.assertNotIn("creation", query)
+
+    def test_a_folio_with_no_payment_is_absent(self):
+        result, _ = self.paid_from([frappe._dict(parent="F-1", first_payment=None)])
+        self.assertEqual(result, {})
+
+    def test_no_folios_means_no_query(self):
+        with mock.patch.object(frappe.db, "sql") as sql:
+            self.assertEqual(audit_report.get_paid_dates([]), {})
         sql.assert_not_called()
 
 

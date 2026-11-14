@@ -399,11 +399,17 @@ def get_payment_modes(folio_names):
 
 
 def get_paid_dates(folio_names):
-    """Earliest payment date per folio, across every ``audit_date``.
+    """Earliest **business date** the folio was paid, across every ``audit_date``.
 
-    Not date-scoped, for the same reason as the mode list: the column answers
-    "when did this guest pay", so a row for a night settled at checkout must
-    carry that later payment.
+    Business date, not wall clock. ``audit_date`` is the date a posting belongs
+    to; ``creation`` is when the row was written, and during a night audit the
+    two differ. RSV-26612's City Ledger payment was taken at 00:56 on
+    2026-11-08 but audited to 2026-11-07 -- the date of the night it settles --
+    so this reports 2026-11-07, which is what the finance spreadsheet is
+    organised by.
+
+    Not date-scoped, for the same reason as the mode list: a row for a night
+    settled at checkout must carry that later payment.
 
     The filter is deliberately **wider** than :func:`get_payment_modes`': a
     credit posted with no Mode of Payment is still money received, so it dates
@@ -415,7 +421,7 @@ def get_paid_dates(folio_names):
     placeholders = ", ".join(["%s"] * len(folio_names))
     rows = frappe.db.sql(
         """
-        select parent, min(creation) as first_payment
+        select parent, min(audit_date) as first_payment
         from `tabInn Folio Transaction`
         where parent in ({0})
           and is_void = 0
@@ -426,7 +432,7 @@ def get_paid_dates(folio_names):
         as_dict=True,
     )
 
-    return {row.parent: row.first_payment.date().isoformat()
+    return {row.parent: row.first_payment.isoformat()
             for row in rows if row.first_payment}
 
 

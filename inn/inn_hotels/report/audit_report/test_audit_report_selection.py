@@ -379,9 +379,20 @@ class TestMoneyColumns(FrappeTestCase):
         reservation, folio = self.charge_folio(taxes=())
         add_transaction(folio, "Payment", "Credit", 260763, DEPARTURE,
                         mode_of_payment="CASH")
-        set_creation(folio, "Payment", DEPARTURE + " 14:49:43")
 
         self.assertEqual(cell(self.only_row(reservation.name), "paid_date"), DEPARTURE)
+
+    def test_paid_date_is_the_business_date_not_the_wall_clock(self):
+        """RSV-26612's shape: a payment taken at 00:56, audited to the day before.
+
+        A fixture's ``creation`` is the real clock, so a creation-based column
+        would report *today* here. The column must follow the business date.
+        """
+        reservation, folio = self.charge_folio(taxes=())
+        add_transaction(folio, "Payment", "Credit", 260763, BEFORE,
+                        mode_of_payment="City Ledger")
+
+        self.assertEqual(cell(self.only_row(reservation.name), "paid_date"), BEFORE)
 
     def test_paid_date_is_blank_when_nothing_was_paid(self):
         reservation, _ = self.charge_folio(taxes=())
