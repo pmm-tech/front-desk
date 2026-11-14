@@ -27,8 +27,9 @@ from frappe.tests.utils import FrappeTestCase
 from inn.helper.revenue_lines import LINE_BREAKFAST, LINE_OTHER, LINE_ROOM
 from inn.inn_hotels.report.audit_report import audit_report
 
-#: A date pair the dev bench has no other folio activity on, so seeded data can
-#: never make these tests pass or fail for unrelated reasons.
+#: Dates the dev bench has no other folio activity on, so seeded data can never
+#: make these tests pass or fail for unrelated reasons.
+BEFORE = "2030-01-14"
 NIGHT = "2030-01-15"
 DEPARTURE = "2030-01-16"
 
@@ -222,3 +223,63 @@ class TestOneNightOneRow(FrappeTestCase):
                          "the night of the stay must produce exactly one row")
         self.assertEqual(self.rows_for(reservation.name, DEPARTURE), [],
                          "a checkout-day charge must not re-add the stay as a row")
+
+
+class TestPaymentModeColumn(FrappeTestCase):
+    """Mode of Payment describes the guest's whole stay, not one date.
+
+    Before this change the column was built from the transactions audited on
+    the report date, so a guest who settled at checkout showed only the
+    checkout-day mode -- and on RSV-26612 the night's row showed City Ledger
+    while the QRIS payment vanished onto a second, phantom row.
+    """
+
+    def mode_cell(self, reservation_name, on_date, show_modes=1):
+        rows = [row for row in audit_report.get_data_detail(on_date, show_modes)
+                if rsv(row) == reservation_name]
+        self.assertEqual(len(rows), 1, "expected exactly one row for the stay")
+        return rows[0][_COLUMN_INDEX["mode_of_payment"]]
+
+    def settled_stay(self, mode, amount=135000, on_date=DEPARTURE, is_void=0):
+        reservation = make_reservation()
+        folio = make_folio(reservation=reservation.name)
+        add_transaction(folio, "Room Charge", "Debit", 260763, NIGHT)
+        add_transaction(folio, "Payment", "Credit", amount, on_date,
+                        mode_of_payment=mode, is_void=is_void)
+        return reservation
+
+    def test_a_payment_after_the_report_date_reaches_the_nights_row(self):
+        reservation = self.settled_stay("BCA QRIS")
+
+        self.assertEqual(self.mode_cell(reservation.name, NIGHT), "BCA QRIS")
+
+    def test_a_deposit_taken_before_arrival_reaches_the_nights_row(self):
+        reservation = self.settled_stay("BCA Online Transfer", on_date=BEFORE)
+
+        self.assertEqual(self.mode_cell(reservation.name, NIGHT),
+                         "BCA Online Transfer")
+
+    def test_modes_are_deduplicated_and_ordered_by_first_payment(self):
+        reservation = make_reservation()
+        folio = make_folio(reservation=reservation.name)
+        add_transaction(folio, "Room Charge", "Debit", 260763, NIGHT)
+        add_transaction(folio, "Room Payment", "Credit", 100000, NIGHT,
+                        mode_of_payment="QRIS")
+        add_transaction(folio, "Payment", "Credit", 50000, NIGHT,
+                        mode_of_payment="CASH")
+        add_transaction(folio, "Payment", "Credit", 50000, DEPARTURE,
+                        mode_of_payment="QRIS")
+
+        # QRIS was paid first, so it leads. "CASH, QRIS" would be the
+        # alphabet's order, not the guest's.
+        self.assertEqual(self.mode_cell(reservation.name, NIGHT), "QRIS, CASH")
+
+    def test_a_voided_credit_contributes_no_mode(self):
+        reservation = self.settled_stay("VOIDED MODE", is_void=1)
+
+        self.assertEqual(self.mode_cell(reservation.name, NIGHT), "")
+
+    def test_the_column_is_suppressed_when_the_filter_is_off(self):
+        reservation = self.settled_stay("CASH")
+
+        self.assertEqual(self.mode_cell(reservation.name, NIGHT, show_modes=0), "")

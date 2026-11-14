@@ -158,10 +158,12 @@ def get_data_detail(on_date, is_show_mode_payment=True):
     warn_unrecognised_tax_service_types(transactions, tax_service_types, line_map)
 
     settlement = get_settlement_status(folio_names, on_date)
+    modes = get_payment_modes(folio_names)
 
     return [
         build_row(row, detail.get(row.folio) or empty_detail(),
-                  settlement.get(row.folio, ""), is_show_mode_payment, on_date)
+                  settlement.get(row.folio, ""), is_show_mode_payment, on_date,
+                  modes.get(row.folio))
         for row in rows
     ]
 
@@ -283,6 +285,50 @@ def get_transactions_for_date(folio_names, on_date):
     )
 
 
+def get_payment_modes(folio_names):
+    """Every Mode of Payment used on these folios, ordered by first use.
+
+    Deliberately **not** date-scoped. The column answers "how did this guest
+    pay", so a payment audited after the report date -- a QRIS settlement at
+    checkout, a deposit taken before arrival -- still describes the folio's row.
+    Scoping it to the report date is what hid RSV-26612's QRIS payment on a
+    second, phantom row instead of showing it here.
+
+    The trade-off is that the report is no longer reproducible for a past date:
+    re-running 2026-11-07 in December shows modes added after 2026-11-07. That
+    is accepted, and stated in the module docstring.
+
+    Order is the guest's, not the alphabet's -- a mode's position is the first
+    time it was used. The query orders by ``creation`` so the first occurrence
+    of each mode is its earliest.
+    """
+    if not folio_names:
+        return {}
+
+    placeholders = ", ".join(["%s"] * len(folio_names))
+    rows = frappe.db.sql(
+        """
+        select parent, mode_of_payment, creation
+        from `tabInn Folio Transaction`
+        where parent in ({0})
+          and is_void = 0
+          and lower(flag) = 'credit'
+          and mode_of_payment is not null
+          and mode_of_payment != ''
+        order by creation, name
+        """.format(placeholders),
+        tuple(folio_names),
+        as_dict=True,
+    )
+
+    modes = {}
+    for row in rows:
+        folio_modes = modes.setdefault(row.parent, [])
+        if row.mode_of_payment not in folio_modes:
+            folio_modes.append(row.mode_of_payment)
+    return modes
+
+
 def get_settlement_status(folio_names, on_date):
     """Paid / Partial / Unpaid per folio, as at ``on_date``.
 
@@ -329,7 +375,6 @@ def empty_detail():
         "breakfast_revenue": 0,
         "comission": 0,
         "total_amount": 0,
-        "modes": set(),
         "creations": [],
     }
 
@@ -353,10 +398,12 @@ def summarise_transactions(transactions, line_map, tax_service_types):
         # Collections: every credit is money received (payment types are not
         # revenue lines and are deliberately not classified). Refunds are debits
         # in this app, so they are naturally excluded.
+        #
+        # Mode of Payment is NOT collected here: it is a folio-level fact
+        # spanning every date, resolved by get_payment_modes(). Collecting it
+        # from one date's rows is what scoped the column to that date.
         if (trx.flag or "").strip().lower() == "credit":
             bucket["total_amount"] += amount
-            if trx.mode_of_payment:
-                bucket["modes"].add(trx.mode_of_payment)
             if trx.creation:
                 bucket["creations"].append(trx.creation)
             continue
@@ -441,9 +488,12 @@ def warn_unmapped_types(unmapped):
     )
 
 
-def build_row(reservation, detail, settlement_status, is_show_mode_payment, on_date):
+def build_row(reservation, detail, settlement_status, is_show_mode_payment, on_date,
+              modes=None):
     creations = detail.get("creations") or []
-    mode_of_payment = ", ".join(sorted(detail.get("modes") or [])) if is_show_mode_payment else ""
+    # ``modes`` is already in payment order; joining preserves it. Sorting here
+    # would report the alphabet's order rather than the guest's.
+    mode_of_payment = ", ".join(modes or []) if is_show_mode_payment else ""
 
     return [
         reservation.name,

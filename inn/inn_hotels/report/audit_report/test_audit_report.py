@@ -159,18 +159,20 @@ class TestAuditReportAggregation(unittest.TestCase):
         self.assertEqual(detail["F-1"]["actual_room_nett"], 0)
         self.assertEqual(detail["F-1"]["breakfast_revenue"], 0)
 
-    def test_mode_of_payment_is_clean_and_deduplicated(self):
-        """Regression: the old code emitted 'BY BCA EDC 550.000, ' with [:-2]."""
+    def test_summarise_transactions_no_longer_collects_modes(self):
+        """Modes are a folio-level fact, resolved by get_payment_modes().
+
+        Collecting them here would scope them to one date's transactions, which
+        is the defect this change removes: RSV-26612's QRIS payment was audited
+        on the departure date, so a date-scoped column could never show it on
+        the night's row. The old test here guarded the `[:-2]` string slicing
+        that produced 'BY BCA EDC 550.000, '; that guard now lives in
+        TestPaymentModes.
+        """
         detail, _ = audit_report.summarise_transactions(
-            [
-                trx("Room Payment", "Credit", 100, mode="BCA EDC"),
-                trx("Room Payment", "Credit", 100, mode="BCA EDC"),
-                trx("Payment", "Credit", 100, mode="Cash"),
-            ],
-            LINE_MAP,
-            TAX_SERVICE_TYPES,
+            [trx("Room Payment", "Credit", 100, mode="BCA EDC")], LINE_MAP, TAX_SERVICE_TYPES
         )
-        self.assertEqual(detail["F-1"]["modes"], {"BCA EDC", "Cash"})
+        self.assertNotIn("modes", detail["F-1"])
 
     def test_tax_service_lines_are_excluded_from_room_nett(self):
         """The column is named "Actual Room Nett", so it must hold the nett.
@@ -348,14 +350,68 @@ class TestAuditReportAggregation(unittest.TestCase):
             [trx("Room Payment", "Credit", 250, mode="BCA EDC")], LINE_MAP, TAX_SERVICE_TYPES
         )
         self.assertEqual(detail["F-1"]["total_amount"], 250)
-        self.assertEqual(detail["F-1"]["modes"], {"BCA EDC"})
+
+
+class TestPaymentModes(unittest.TestCase):
+    """Mode of Payment is the guest's whole payment history, in payment order.
+
+    Deliberately not date-scoped: the column answers "how did this guest pay",
+    so a payment audited after the report date -- a QRIS settlement at checkout,
+    an advance deposit taken before arrival -- still describes the folio's row.
+    """
+
+    def modes_from(self, rows, folios=("F-1",)):
+        with mock.patch.object(frappe.db, "sql", return_value=rows) as sql:
+            return audit_report.get_payment_modes(list(folios)), sql.call_args
+
+    def payment(self, folio, mode, creation):
+        return frappe._dict(parent=folio, mode_of_payment=mode, creation=creation)
+
+    def test_modes_are_ordered_by_first_payment(self):
+        modes, _ = self.modes_from([
+            self.payment("F-1", "QRIS", "2026-11-08 14:49:43"),
+            self.payment("F-1", "CASH", "2026-11-08 15:10:00"),
+        ])
+        # Chronological, not alphabetical: the guest paid QRIS first.
+        self.assertEqual(modes["F-1"], ["QRIS", "CASH"])
+
+    def test_a_repeated_mode_appears_once(self):
+        modes, _ = self.modes_from([
+            self.payment("F-1", "Cash", "2026-11-07 09:00:00"),
+            self.payment("F-1", "Cash", "2026-11-09 09:00:00"),
+        ])
+        self.assertEqual(modes["F-1"], ["Cash"])
+
+    def test_modes_are_grouped_per_folio(self):
+        modes, _ = self.modes_from([
+            self.payment("F-1", "Cash", "2026-11-07 09:00:00"),
+            self.payment("F-2", "QRIS", "2026-11-07 10:00:00"),
+        ], folios=("F-1", "F-2"))
+        self.assertEqual(modes["F-1"], ["Cash"])
+        self.assertEqual(modes["F-2"], ["QRIS"])
+
+    def test_the_query_is_not_date_scoped(self):
+        """A payment on another date must still describe this folio's row."""
+        _, call = self.modes_from([])
+        self.assertNotIn("audit_date", call[0][0])
+
+    def test_the_query_takes_only_non_void_credits(self):
+        _, call = self.modes_from([])
+        query = call[0][0].lower()
+        self.assertIn("is_void = 0", query)
+        self.assertIn("credit", query)
+        self.assertIn("flag", query)
+
+    def test_no_folios_means_no_query(self):
+        with mock.patch.object(frappe.db, "sql") as sql:
+            self.assertEqual(audit_report.get_payment_modes([]), {})
+        sql.assert_not_called()
 
 
 class TestAuditReportRowShaping(unittest.TestCase):
     def setUp(self):
         self.detail = audit_report.empty_detail()
         self.detail["total_amount"] = 150
-        self.detail["modes"] = {"Cash"}
         self.detail["actual_room_nett"] = 500
         self.detail["actual_room_rate"] = 550000
 
@@ -408,6 +464,30 @@ class TestAuditReportRowShaping(unittest.TestCase):
             frappe._dict(name="RSV-1", customer_id="C", room_type="", bed_type="",
                          actual_room_id="", channel="", bill_instructions=None),
             self.detail, audit_report.STATUS_PAID, 0, ON_DATE,
+            modes=["Cash", "QRIS"],
+        )
+        self.assertEqual(row_value(row, "mode_of_payment"), "")
+
+    def test_mode_of_payment_joins_in_payment_order(self):
+        """Order is the guest's, not the alphabet's.
+
+        RSV-26612 on Jakarta paid by City Ledger for the room and BCA QRIS at
+        checkout. Sorted, that reads "BCA QRIS, City Ledger" -- which misstates
+        which payment came first.
+        """
+        row = audit_report.build_row(
+            frappe._dict(name="RSV-1", customer_id="C", room_type="", bed_type="",
+                         actual_room_id="", channel="", bill_instructions=None),
+            self.detail, audit_report.STATUS_PAID, 1, ON_DATE,
+            modes=["City Ledger", "BCA QRIS"],
+        )
+        self.assertEqual(row_value(row, "mode_of_payment"), "City Ledger, BCA QRIS")
+
+    def test_mode_of_payment_is_empty_when_no_folio_paid(self):
+        row = audit_report.build_row(
+            frappe._dict(name="RSV-1", customer_id="C", room_type="", bed_type="",
+                         actual_room_id="", channel="", bill_instructions=None),
+            self.detail, audit_report.STATUS_PAID, 1, ON_DATE,
         )
         self.assertEqual(row_value(row, "mode_of_payment"), "")
 
@@ -476,7 +556,8 @@ class TestAuditReportFolioDrivenRows(unittest.TestCase):
 
         with mock.patch.object(audit_report, "get_folio_rows", return_value=rows), \
                 mock.patch.object(audit_report, "get_transactions_for_date", return_value=[]), \
-                mock.patch.object(audit_report, "get_settlement_status", return_value={}):
+                mock.patch.object(audit_report, "get_settlement_status", return_value={}), \
+                mock.patch.object(audit_report, "get_payment_modes", return_value={}):
             out = audit_report.get_data_detail(ON_DATE, 1)
 
         self.assertEqual(len(out), 2)
@@ -491,11 +572,24 @@ class TestAuditReportFolioDrivenRows(unittest.TestCase):
         with mock.patch.object(audit_report, "get_folio_rows", return_value=rows), \
                 mock.patch.object(audit_report, "get_transactions_for_date",
                                   return_value=[]) as transactions, \
-                mock.patch.object(audit_report, "get_settlement_status", return_value={}):
+                mock.patch.object(audit_report, "get_settlement_status", return_value={}), \
+                mock.patch.object(audit_report, "get_payment_modes", return_value={}):
             audit_report.get_data_detail(ON_DATE, 1)
 
         self.assertEqual(sorted(transactions.call_args[0][0]), ["F-1", "F-2"])
         self.assertEqual(transactions.call_args[0][1], ON_DATE)
+
+    def test_the_folios_payment_modes_reach_the_row(self):
+        rows = [self.folio_row("F-1", "RSV-1")]
+
+        with mock.patch.object(audit_report, "get_folio_rows", return_value=rows), \
+                mock.patch.object(audit_report, "get_transactions_for_date", return_value=[]), \
+                mock.patch.object(audit_report, "get_settlement_status", return_value={}), \
+                mock.patch.object(audit_report, "get_payment_modes",
+                                  return_value={"F-1": ["City Ledger", "BCA QRIS"]}):
+            out = audit_report.get_data_detail(ON_DATE, 1)
+
+        self.assertEqual(row_value(out[0], "mode_of_payment"), "City Ledger, BCA QRIS")
 
 
 class TestRoomLineTypes(unittest.TestCase):
