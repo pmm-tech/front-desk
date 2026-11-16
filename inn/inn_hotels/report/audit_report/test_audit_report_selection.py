@@ -160,6 +160,15 @@ class TestAuditReportSelection(FrappeTestCase):
         self.assertNotIn(folio.name, self.selected())
 
     def test_breakfast_alone_does_not_select_the_folio(self):
+        """Breakfast populates a row; it does not create one.
+
+        Known consequence, accepted: a folio whose only posting on the date is
+        breakfast gets no row, so that breakfast is not in this export. The
+        alternative -- selecting on any charge -- is what put phantom rows in
+        the report, and ``Front Desk Daily Revenue Recap`` carries every
+        breakfast folio without exception. Breakfast that lands on a folio with
+        a room charge that date is reported in full.
+        """
         folio = make_folio()
         add_transaction(folio, "Breakfast Charge", "Debit", 72727, NIGHT)
 
@@ -348,16 +357,37 @@ class TestMoneyColumns(FrappeTestCase):
 
         self.assertEqual(cell(self.only_row(reservation.name), "total_amount"), 260763)
 
-    def test_breakfast_and_commission_stay_out_of_the_row(self):
+    def test_breakfast_reaches_bf_revenue_but_commission_stays_out(self):
+        """Breakfast is the one non-room line with a column of its own.
+
+        Selection is unchanged -- a posted room charge is still what puts the
+        folio in the report -- but the row that folio produces carries the
+        breakfast posted on the same date, because a column headed "BF Revenue"
+        that always reads 0 cannot be told from a day that sold no breakfast.
+        """
         reservation, folio = self.charge_folio(taxes=())
         add_transaction(folio, "Breakfast Charge", "Debit", 72727, NIGHT)
         add_transaction(folio, "Commision", "Debit", 10000, NIGHT)
 
         row = self.only_row(reservation.name)
 
-        self.assertEqual(cell(row, "bf_revenue"), 0)
+        self.assertEqual(cell(row, "bf_revenue"), 72727)
         self.assertEqual(cell(row, "comission"), 0)
         self.assertEqual(cell(row, "total_amount"), 260763)
+
+    def test_breakfast_tax_service_is_not_bf_revenue(self):
+        reservation, folio = self.charge_folio(taxes=())
+        add_transaction(folio, "Breakfast Charge", "Debit", 72727, NIGHT)
+        add_transaction(folio, "Breakfast Charge Tax/Service", "Debit", 15272, NIGHT)
+
+        self.assertEqual(cell(self.only_row(reservation.name), "bf_revenue"), 72727)
+
+    def test_breakfast_on_another_date_is_not_this_row(self):
+        """The column is scoped to the business date, like the room columns."""
+        reservation, folio = self.charge_folio(taxes=())
+        add_transaction(folio, "Breakfast Charge", "Debit", 72727, DEPARTURE)
+
+        self.assertEqual(cell(self.only_row(reservation.name), "bf_revenue"), 0)
 
     def test_posting_date_carries_the_charge_posting_not_the_payments(self):
         reservation, folio = self.charge_folio(taxes=())

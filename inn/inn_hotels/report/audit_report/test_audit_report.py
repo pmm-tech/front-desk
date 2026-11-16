@@ -220,13 +220,15 @@ class TestAuditReportAggregation(unittest.TestCase):
         )
         self.assertEqual(detail["F-1"]["actual_room_nett"], 500)
 
-    def test_breakfast_no_longer_reaches_a_column(self):
-        """Breakfast is out of scope: the recap carries it, with the tax split.
+    def test_breakfast_nett_reaches_bf_revenue(self):
+        """BF Revenue holds the breakfast nett; the room columns stay room.
 
-        The old test here pinned that breakfast tax/service was excluded from
-        the breakfast nett. Nothing accumulates breakfast now, so there is no
-        nett to exclude it from -- the assertion that matters is that a
-        breakfast posting stays out of the room columns too.
+        The column is part of the 17-column contract the finance spreadsheet is
+        laid out for, so it has to mean what its header says. Regression: from
+        v1.2.4 (``079c46f``) the column stayed in the contract but nothing
+        accumulated it, so every row read 0 and a folio that sold breakfast
+        could not be told from one that sold none -- the front desk found it
+        against a folio whose own breakfast charge was not zero.
         """
         detail, _ = audit_report.summarise_transactions(
             [
@@ -237,8 +239,33 @@ class TestAuditReportAggregation(unittest.TestCase):
             LINE_MAP,
             TAX_SERVICE_TYPES,
         )
-        self.assertEqual(detail["F-1"]["breakfast_revenue"], 0)
+        # Nett: the tax/service element of the line is excluded by type, exactly
+        # as it is for the room, because the rate varies and a posting may carry
+        # only one of a tax's breakdown rows.
+        self.assertEqual(detail["F-1"]["breakfast_revenue"], 80)
+        # And breakfast stays out of the room columns, which remain room figures.
         self.assertEqual(detail["F-1"]["total_amount"], 500)
+        self.assertEqual(detail["F-1"]["actual_room_nett"], 500)
+
+    def test_breakfast_alone_still_produces_a_zero_room_row(self):
+        """A breakfast-only folio contributes breakfast and no room revenue.
+
+        The two bases are independent: this row reports the breakfast it sold
+        while every room column stays 0, which is what the folio itself shows.
+        """
+        detail, _ = audit_report.summarise_transactions(
+            [trx("Breakfast Charge", "Debit", 72727)], LINE_MAP, TAX_SERVICE_TYPES
+        )
+        self.assertEqual(detail["F-1"]["breakfast_revenue"], 72727)
+        self.assertEqual(detail["F-1"]["actual_room_nett"], 0)
+        self.assertEqual(detail["F-1"]["total_amount"], 0)
+
+    def test_a_breakfast_credit_is_not_bf_revenue(self):
+        """Credits are money received, never revenue -- breakfast included."""
+        detail, _ = audit_report.summarise_transactions(
+            [trx("Breakfast Charge", "Credit", 72727)], LINE_MAP, TAX_SERVICE_TYPES
+        )
+        self.assertEqual(detail["F-1"]["breakfast_revenue"], 0)
 
     def test_room_nett_follows_the_posted_rows_not_a_tax_rate(self):
         """The tax/service split is not a fixed 21%.
