@@ -28,9 +28,16 @@ The money columns describe the room charge, not the day's takings:
 * ``total_amount`` is the **gross** room charge posted on the date -- the charge
   plus its ``Room Charge Tax/Service`` rows.
 * ``actual_room_nett`` is that charge without the tax/service rows.
-* ``bf_revenue`` and ``comission`` are always 0. Breakfast, commission and every
-  other non-room line are out of scope: ``Front Desk Daily Revenue Recap``
-  carries them, with the tax split, as a strict superset.
+* ``bf_revenue`` is the **nett** breakfast charge posted on the date, on the
+  same basis: ``Breakfast Charge`` without its ``Breakfast Charge Tax/Service``.
+  The column is populated because it is part of the 17-column contract the
+  finance spreadsheet is laid out for, and a column headed "BF Revenue" that is
+  always 0 cannot be told apart from a day on which no breakfast was sold.
+  Breakfast is not part of ``total_amount``, which stays a room figure, so the
+  two columns must be read on different bases.
+* ``comission`` is always 0. Commission and every other non-room line are out of
+  scope: ``Front Desk Daily Revenue Recap`` carries them, with the tax split, as
+  a strict superset.
 
 ``mode_of_payment`` and ``paid_date`` are the exception to the date scoping.
 Both span the whole folio, so a night settled at checkout still shows how and
@@ -54,6 +61,13 @@ Fixed relative to the previous implementation
                     Charge`` and silently turned the column into gross -- room
                     overstated 20% on the date this was found. The split now
                     uses :func:`inn.helper.revenue_lines.get_tax_service_types`.
+``bf_revenue``     read **0 on every row** from v1.2.4 (``079c46f``) until this
+                    change. The column stayed in the 17-column contract but
+                    nothing accumulated it, so a row that sold breakfast and a
+                    row that sold none were indistinguishable -- the front desk
+                    found it on a folio whose own breakfast charge was not zero.
+                    Restored to the breakfast nett it held in v1.2.3; the row
+                    selection and the room columns are untouched.
 ``remark``          unchanged (``Inn Folio.bill_instructions``).
 
 The nett column deliberately does **not**:
@@ -479,8 +493,9 @@ def empty_detail():
     return {
         "actual_room_rate": 0,
         "actual_room_nett": 0,
-        # Kept so the dead columns are explicit rather than absent. Nothing
-        # accumulates them: breakfast and commission are out of scope.
+        # Breakfast is the one non-room line this export carries -- see the
+        # module docstring. Comission is kept so the dead column stays explicit
+        # rather than absent: nothing accumulates it.
         "breakfast_revenue": 0,
         "comission": 0,
         "total_amount": 0,
@@ -497,11 +512,11 @@ def summarise_transactions(transactions, line_map, tax_service_types):
     exists to prevent. Making it required turns that mistake into a
     ``TypeError`` at the call site instead of a plausible wrong number.
 
-    Only **room-line debits** feed a column. Credits, breakfast and commission
-    are deliberately ignored: this is a room-charge ledger, and Front Desk Daily
-    Revenue Recap carries collections and non-room revenue as a strict superset.
-    Mode of Payment is likewise not collected here -- it is a folio-level fact
-    spanning every date; see :func:`get_payment_modes`.
+    Only room-line and breakfast-line debits feed a column. Credits, commission
+    and every other non-room line are deliberately ignored: ``Front Desk Daily
+    Revenue Recap`` carries collections and the remaining non-room revenue as a
+    strict superset. Mode of Payment is likewise not collected here -- it is a
+    folio-level fact spanning every date; see :func:`get_payment_modes`.
     """
     detail = {}
     charge_types = set()
@@ -512,19 +527,31 @@ def summarise_transactions(transactions, line_map, tax_service_types):
         if (trx.flag or "").strip().lower() == "credit":
             continue
 
-        # Recorded before the room-line filter so a newly introduced charge type
+        # Recorded before the revenue-line filter so a newly introduced charge type
         # is still reported as unmapped rather than silently ignored.
         charge_types.add(trx.transaction_type)
-        if classify(trx.transaction_type, line_map) != LINE_ROOM:
-            continue
+        line = classify(trx.transaction_type, line_map)
 
         amount = flt(trx.amount)
         is_tax_service = trx.transaction_type in tax_service_types
+
+        # Breakfast is the one non-room line with a column, so it is summed here
+        # rather than skipped. Its tax/service element is excluded by type, the
+        # same way the room's is, and for the same reason: the rate varies and a
+        # posting may carry only one of a tax's breakdown rows.
+        if line == LINE_BREAKFAST:
+            if not is_tax_service:
+                bucket["breakfast_revenue"] += amount
+            continue
+
+        if line != LINE_ROOM:
+            continue
 
         # Total Amount is the **gross** room charge -- every room-line debit,
         # the tax and service rows included. The nett column excludes them.
         # Subtracting a percentage instead would be wrong: the rate varies per
         # reservation and a posting may carry only one of a tax's breakdown rows.
+        # Breakfast is not part of either: both columns stay room figures.
         bucket["total_amount"] += amount
         if not is_tax_service:
             bucket["actual_room_nett"] += amount
